@@ -13,6 +13,7 @@ curl -fsSL https://github.com/winbeau/tools-claw/releases/latest/download/instal
 ```bash
 beauclaw config set
 beauclaw notice add notify@example.com
+beauclaw test
 beauclaw login --browser
 beauclaw start
 beauclaw status
@@ -23,7 +24,7 @@ beauclaw status
 指定版本安装：
 
 ```bash
-curl -fsSL https://github.com/winbeau/tools-claw/releases/latest/download/install.sh | BEAUCLAW_VERSION=0.2.0 sh
+curl -fsSL https://github.com/winbeau/tools-claw/releases/latest/download/install.sh | BEAUCLAW_VERSION=0.2.1 sh
 ```
 
 再次运行安装脚本即可升级，然后执行 `beauclaw stop && beauclaw start` 使用新版本。安装脚本不会自动停止运行中的采集进程。可用 `BEAUCLAW_BIN_DIR` / `BEAUCLAW_INSTALL_DIR` 自定义命令目录和程序目录。
@@ -81,8 +82,10 @@ beauclaw notice delete 3
 每个收件人单独发送、独立重试；某个地址失败不会阻塞其他地址，邮件不披露其他通知邮箱。以下命令向**当前列表所有邮箱实际发送测试邮件**：
 
 ```bash
-beauclaw notice test
+beauclaw test
 ```
+
+向每个邮箱单独发送一封主题为 `[BeauClaw] SMTP 测试邮件` 的邮件，终端逐个显示 SMTP 是否接受。无需 GitCode 登录或启动采集；某个邮箱失败后仍继续尝试其他邮箱，存在失败时命令返回非零退出码。通知列表为空时提示先添加邮箱。原命令 `beauclaw notice test` 仍可使用；自定义路径可传 `--db PATH` / `--mail-config PATH`。
 
 ## 登录赛事与采集
 
@@ -141,7 +144,7 @@ beauclaw serve  # 停止采集后单独看历史
 | GitCode 登录凭据 | `~/.config/beauclaw/gitcode.json` |
 | 快照、通知列表、发件队列 | `~/.local/share/beauclaw/beauclaw.sqlite3` |
 | 后台进程状态、日志 | `~/.local/share/beauclaw/beauclaw.service.json` / `beauclaw.log` |
-| 通过安装脚本安装的版本 | `~/.local/share/beauclaw/app/v0.2.0/` |
+| 通过安装脚本安装的版本 | `~/.local/share/beauclaw/app/v0.2.1/` |
 | 独立浏览器会话 | `~/.local/share/beauclaw/browser-profile/` |
 
 凭据文件权限 `0600`。`BEAUCLAW_CONFIG_DIR` / `BEAUCLAW_DATA_DIR` 可重定向目录，`BEAUCLAW_SMTP_PASSWORD` 可覆盖文件中的密码。每轮重新读取配置，更新密码无需重启。
@@ -167,4 +170,4 @@ uv run python -m unittest discover -s tests -v
 uv run python scripts/build_release.py
 ```
 
-测试使用合成榜单与模拟 SMTP，并测试真实 tmux 启停、重复启动、旧状态文件和其他会话隔离；不会发送真实邮件。构建脚本在 `dist/v0.2.0/` 输出 wheel、包含锁定依赖的源码包、安装脚本与 `SHA256SUMS`。
+测试使用合成榜单与模拟 SMTP，并测试真实 tmux 启停、重复启动、旧状态文件和其他会话隔离；不会发送真实邮件。构建脚本在 `dist/v0.2.1/` 输出 wheel、包含锁定依赖的源码包、安装脚本与 `SHA256SUMS`。

@@ -35,7 +35,7 @@ main() {
     case "$(uname -s)" in Linux|Darwin) ;; *) die "目前支持 Linux 和 macOS。" ;; esac
     command -v curl >/dev/null 2>&1 || die "请先安装 curl。"
     command -v tar >/dev/null 2>&1 || die "请先安装 tar。"
-    beau_version=${BEAUCLAW_VERSION:-0.2.0}
+    beau_version=${BEAUCLAW_VERSION:-0.2.1}
     case "$beau_version" in v*) beau_version=${beau_version#v} ;; esac
     case "$beau_version" in ''|*[!0-9.]*|.*|*.) die "无效版本号。" ;; esac
     beau_release_base=${BEAUCLAW_RELEASE_BASE_URL:-https://github.com/winbeau/tools-claw/releases}
@@ -105,7 +105,7 @@ main() {
             printf '请将 %s 加入 PATH，或使用上述命令的绝对路径。\n' "$beau_bin_dir"
         fi
     fi
-    printf '\n首次使用：\n  beauclaw config set\n  beauclaw notice add 通知邮箱\n  beauclaw login --browser\n  beauclaw start\n\n管理：beauclaw status / beauclaw stop\n'
+    printf '\n首次使用：\n  beauclaw config set\n  beauclaw notice add 通知邮箱\n  beauclaw test\n  beauclaw login --browser\n  beauclaw start\n\n管理：beauclaw status / beauclaw stop\n'
     printf '升级：再次运行安装命令，再执行 beauclaw stop && beauclaw start。\n'
 }
 

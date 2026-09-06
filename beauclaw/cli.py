@@ -221,6 +221,11 @@ def main() -> int:
             command.add_argument("addresses", nargs="+", help="邮箱地址；delete 也接受 list 中的编号")
         if action == "test":
             command.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
+    test = commands.add_parser("test", help="向通知列表中所有邮箱发送测试邮件",
+                               description="使用当前 SMTP 配置，向通知列表中所有邮箱各发送一封测试邮件。")
+    test.add_argument("--db", type=Path, default=data_dir() / "beauclaw.sqlite3")
+    test.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
+    test.set_defaults(notice_command="test")
     for name in ("login", "watch", "start", "stop", "status", "serve", "export", "snapshot"):
         command = commands.add_parser(name)
         if name in ("login", "watch", "start"):
@@ -270,7 +275,7 @@ def main() -> int:
                 configure_mail(args.config_file, args.key, args.value)
             else:
                 print(json.dumps(show_config(args.config_file), ensure_ascii=False, indent=2))
-        elif args.command == "notice":
+        elif args.command in ("notice", "test"):
             store = Store(args.db)
             try:
                 if args.notice_command == "add":
