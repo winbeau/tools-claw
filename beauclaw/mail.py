@@ -17,7 +17,7 @@ from email.utils import format_datetime, make_msgid
 from pathlib import Path
 
 from beauclaw.auth import load_auth, save_auth
-from beauclaw.core import Store, fetch, parse_board, top_ten, utcnow
+from beauclaw.core import Store, fetch, parse_board, should_notify_leader, top_ten, utcnow
 from beauclaw.email_template import render_email
 from beauclaw.ui import activity
 from beauclaw.paths import config_dir
@@ -57,12 +57,12 @@ def load_mail_config(path: Path) -> dict:
         raise ValueError("SMTP password is missing; run beauclaw config set mail.password")
     return {**config, "provider": provider, "host": PROVIDERS[provider]["host"], "port": port,
             "security": "ssl" if port == 465 else "starttls", "username": config["sender"],
-            "password": password, "boards": ["realtime_region_ranking"], "notify_score": True}
+            "password": password, "boards": ["realtime_region_ranking"]}
 
 
 def mail_policy(config: dict) -> dict:
     # Only routing and notification preferences may be saved with observations.
-    return {key: config[key] for key in ("sender", "boards", "notify_score")}
+    return {key: config[key] for key in ("sender", "boards")}
 
 
 def configure_mail(path: Path, key: str | None = None, value: str | None = None) -> None:
@@ -124,7 +124,7 @@ def show_config(path: Path) -> dict:
             "mail.sender": config.get("sender", "not set"),
             "mail.password": "set (environment)" if os.environ.get("BEAUCLAW_SMTP_PASSWORD") else
                              "set" if config.get("password") else "not set",
-            "notice.rule": "Only the regional leader or score changes for each subscribed competition", "config_file": str(path)}
+            "notice.rule": "Only a regional leader's score rise or a change of leading team; score drops remain critical records", "config_file": str(path)}
 
 
 def create_message(payload: dict, message_id: str) -> EmailMessage:
@@ -133,6 +133,9 @@ def create_message(payload: dict, message_id: str) -> EmailMessage:
     message["To"] = payload["recipient"]
     message["Date"] = format_datetime(datetime.now(timezone.utc))
     message["Message-ID"] = message_id
+    if not payload.get("test"):
+        message["Importance"] = "high"
+        message["X-Priority"] = "1"
     subject, plain, html = render_email(payload)
     message["Subject"] = subject
     message.set_content(plain)
@@ -165,6 +168,12 @@ def deliver_one(store: Store, config: dict) -> bool:
     if row is None:
         return False
     payload = json.loads(row["payload_json"])
+    # Apply the current rule to old queued jobs as well as newly captured changes.
+    payload["events"] = [event for event in payload["events"] if should_notify_leader(event)]
+    if not payload["events"]:
+        with store.db:
+            store.db.execute("UPDATE mail_outbox SET cancelled_at=?,last_error=NULL WHERE id=?", (utcnow(), row["id"]))
+        return True
     if payload.get("ranking_id"):
         from beauclaw.rankings import is_active
         if not is_active(store.notice_db, payload["ranking_id"], payload.get("ranking_generation")):
@@ -230,14 +239,17 @@ class MailWorker(threading.Thread):
         self.join(timeout=12)
 
 
-def test_mail(path: Path, store: Store, auth_file: Path | None = None, token_file: Path | None = None) -> None:
+def test_mail(path: Path, store: Store, auth_file: Path | None = None, token_file: Path | None = None,
+              recipient: str | None = None) -> None:
     from beauclaw.rankings import Rankings
+    if recipient is not None:
+        recipient = address(recipient.strip()).lower()
     with Rankings(store.path) as registry:
         rankings = registry.list()
     if not rankings:
         raise ValueError("Rankings is empty; no leaderboard is being monitored.")
     config = load_mail_config(path)
-    notices = store.notices()
+    notices = [{"email": recipient}] if recipient is not None else store.notices()
     if not notices:
         raise ValueError("The recipient list is empty; run beauclaw notice add EMAIL first")
     first = rankings[0]

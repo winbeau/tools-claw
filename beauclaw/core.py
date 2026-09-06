@@ -15,6 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 DEFAULT_COMPETITION = "2094722369343447042"
+SNAPSHOT_LIMIT = 100
 API_ORIGIN = "https://web-api.gitcode.com"
 BOARDS = {
     "realtime_region_ranking": "参赛区域实时总榜",
@@ -35,6 +36,12 @@ def utcnow() -> str:
 
 def dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def should_notify_leader(event: dict) -> bool:
+    before, after = event["before"], event["after"]
+    return (before.get("key") != after.get("key") or before["name"] != after["name"]
+            or Decimal(after["score"]) > Decimal(before["score"]))
 
 
 def competition_id(value: str) -> str:
@@ -259,7 +266,7 @@ class Store:
                 id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, captured_at TEXT NOT NULL,
                 url TEXT NOT NULL, http_status INTEGER, status TEXT NOT NULL,
                 body_sha256 TEXT NOT NULL, headers_json TEXT NOT NULL, info_json TEXT NOT NULL,
-                error TEXT);
+                error TEXT, critical INTEGER NOT NULL DEFAULT 0, critical_reason TEXT);
             CREATE TABLE IF NOT EXISTS states (scope TEXT PRIMARY KEY, state_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY, poll_id INTEGER NOT NULL, observed_at TEXT NOT NULL,
@@ -287,6 +294,24 @@ class Store:
                 used.add(code)
                 self.db.execute("UPDATE notices SET short_id=? WHERE id=?", (code, row["id"]))
             self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS notices_short_id ON notices(short_id)")
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(polls)")}
+            if "critical" not in columns:
+                self.db.execute("ALTER TABLE polls ADD COLUMN critical INTEGER NOT NULL DEFAULT 0")
+            if "critical_reason" not in columns:
+                self.db.execute("ALTER TABLE polls ADD COLUMN critical_reason TEXT")
+            self.db.execute("CREATE INDEX IF NOT EXISTS polls_critical_id ON polls(critical,id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS polls_body ON polls(body_sha256)")
+            if not self.db.execute("SELECT 1 FROM meta WHERE key='snapshot_retention_v1'").fetchone():
+                # Protect historical evidence before the first automatic cleanup, even
+                # if mail was disabled or there were no recipients at the time.
+                for row in self.db.execute("SELECT poll_id,details_json FROM events WHERE kind='leader_changed' AND scope LIKE '%:realtime_region_ranking'").fetchall():
+                    self._mark_critical(row["poll_id"], "leader_changed")
+                    self._mark_critical(json.loads(row["details_json"]).get("previous_poll_id"), "before_leader_change")
+                for row in self.db.execute("SELECT poll_id,payload_json FROM mail_outbox").fetchall():
+                    self._mark_critical(row["poll_id"], "mail_evidence")
+                    for event in json.loads(row["payload_json"]).get("events", []):
+                        self._mark_critical(event.get("details", {}).get("previous_poll_id"), "before_leader_change")
+                self.db.execute("INSERT INTO meta VALUES ('snapshot_retention_v1','1')")
         if event_id:
             existing = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
             if existing and existing[0] != event_id:
@@ -297,6 +322,33 @@ class Store:
 
     def close(self) -> None:
         self.db.close()
+
+    def _mark_critical(self, poll_id: int | None, reason: str) -> None:
+        self.db.execute("""UPDATE polls SET critical=1,critical_reason=?
+            WHERE id=? AND (critical=0 OR ?='leader_changed')""", (reason, poll_id, reason))
+
+    def _prune_snapshots(self) -> None:
+        # Keep live comparison baselines even across extended outages and schedule
+        # switches, so a future change can still protect its preceding raw snapshot.
+        anchors = {row[0] for row in self.db.execute("SELECT max(id) FROM polls") if row[0] is not None}
+        for row in self.db.execute("SELECT state_json FROM states"):
+            poll_id = json.loads(row[0]).get("last_valid_poll_id")
+            if poll_id is not None:
+                anchors.add(poll_id)
+        normal = {row[0]: row[1] for row in self.db.execute("SELECT id,body_sha256 FROM polls WHERE critical=0 ORDER BY id DESC")}
+        if len(normal) <= SNAPSHOT_LIMIT:
+            return
+        keep = anchors.intersection(normal)
+        for poll_id in normal:
+            if len(keep) >= SNAPSHOT_LIMIT:
+                break
+            keep.add(poll_id)
+        expired = {poll_id: sha for poll_id, sha in normal.items() if poll_id not in keep}
+        self.db.executemany("DELETE FROM polls WHERE id=? AND critical=0", ((poll_id,) for poll_id in expired))
+        # Bodies may be shared by many captures. Remove only unreferenced bodies;
+        # event history, states and pending/sent mail are never pruned.
+        self.db.executemany("DELETE FROM bodies WHERE sha256=? AND NOT EXISTS (SELECT 1 FROM polls WHERE body_sha256=bodies.sha256)",
+                            ((sha,) for sha in set(expired.values())))
 
     def record(self, response: Response, missing_samples: int = 2,
                mail_policy: dict | None = None) -> tuple[dict, list]:
@@ -344,15 +396,21 @@ class Store:
                                 event["kind"], event["member_key"], event["name"], dumps(event["before"]),
                                 dumps(event["after"]), dumps(event["details"])))
                         events.append({**event, "scope": scope, "poll_id": poll_id})
+            critical = False
+            for event in events:
+                if event["kind"] == "leader_changed" and event["scope"].endswith(":realtime_region_ranking"):
+                    critical = True
+                    self._mark_critical(poll_id, "leader_changed")
+                    self._mark_critical(event["details"].get("previous_poll_id"), "before_leader_change")
             if mail_policy:
                 leaders = [e for e in events if e["kind"] == "leader_changed"
                            and e["scope"].split(":", 1)[1] in mail_policy["boards"]
-                           and (mail_policy["notify_score"] or e["before"]["key"] != e["after"]["key"])]
+                           and should_notify_leader(e)]
                 if leaders:
                     event_id = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()[0]
                     for notice in self.notices():
                         message = {"competition_id": event_id, "captured_at": response.captured_at,
-                                   "poll_id": poll_id, "events": leaders, "sender": mail_policy["sender"],
+                                   "poll_id": poll_id, "events": leaders, "critical": True, "sender": mail_policy["sender"],
                                    "recipient": notice["email"], "recipient_id": notice["id"],
                                    "recipient_created_at": notice["created_at"],
                                    "schedule_name": info["schedule_name"],
@@ -362,14 +420,16 @@ class Store:
                                    "top10": top_ten(info)}
                         self.db.execute("INSERT INTO mail_outbox (poll_id,recipient,message_id,payload_json) VALUES (?,?,?,?)",
                                         (poll_id, notice["email"], f"<{uuid.uuid4().hex}@beauclaw.local>", dumps(message)))
+            self._prune_snapshots()
         return {"id": poll_id, "status": status, "error": error, "captured_at": response.captured_at,
-                "info": metadata, "http_status": response.status}, events
+                "info": metadata, "http_status": response.status, "critical": critical}, events
 
     def summary(self) -> dict:
         def poll(row: Any) -> dict | None:
             if row is None:
                 return None
             value = dict(row)
+            value["critical"] = bool(value["critical"])
             value["info"] = json.loads(value.pop("info_json"))
             value.pop("headers_json")
             return value
@@ -390,6 +450,8 @@ class Store:
                     "mail_last_error": (lambda r: r[0] if r else None)(self.db.execute(
                         "SELECT last_error FROM mail_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL AND last_error IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()),
                     "poll_count": self.db.execute("SELECT count(*) FROM polls").fetchone()[0],
+                    "critical_poll_count": self.db.execute("SELECT count(*) FROM polls WHERE critical=1").fetchone()[0],
+                    "snapshot_limit": SNAPSHOT_LIMIT,
                     "event_count": self.db.execute("SELECT count(*) FROM events").fetchone()[0]}
         finally:
             self.db.rollback()
@@ -403,6 +465,12 @@ class Store:
             event = dict(row)
             for key in ("before", "after", "details"):
                 event[key] = json.loads(event.pop(f"{key}_json"))
+            snapshot = self.db.execute("SELECT critical FROM polls WHERE id=?", (event["poll_id"],)).fetchone()
+            event["critical"] = bool(snapshot and snapshot[0])
+            event["snapshot_available"] = snapshot is not None
+            for field, poll_id in (("previous_snapshot_available", event["details"].get("previous_poll_id")),
+                                   ("last_seen_snapshot_available", event["details"].get("last_seen_poll_id"))):
+                event[field] = self.db.execute("SELECT 1 FROM polls WHERE id=?", (poll_id,)).fetchone() is not None
             result.append(event)
         return result
 
@@ -446,6 +514,7 @@ class Store:
         if row is None:
             return None
         result = dict(row)
+        result["critical"] = bool(result["critical"])
         result["raw_body"] = zlib.decompress(result.pop("compressed")).decode("utf-8", errors="replace")
         for key in ("headers", "info"):
             result[key] = json.loads(result.pop(f"{key}_json"))

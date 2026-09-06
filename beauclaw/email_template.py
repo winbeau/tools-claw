@@ -21,11 +21,12 @@ def render_email(payload: dict) -> tuple[str, str, str]:
     stamp = f"{observed:%Y-%m-%d %H:%M:%S}（北京时间）"
     url = "https://competition.gitcode.com/competition/" + quote(str(payload.get("competition_id") or DEFAULT_COMPETITION), safe="") + "/live-ranking"
     rows = sorted(payload.get("top10") or [], key=lambda row: row["rank"])[:10]
-    subject = f"[ICTHub] 榜单测试 · {competition}" if test else f"[ICTHub · 榜一变动] {competition} · {schedule} · 快照 #{payload['poll_id']}"
+    subject = f"[ICTHub] 榜单测试 · {competition}" if test else f"[ICTHub · 关键邮件 · 榜一变动] {competition} · {schedule} · 快照 #{payload['poll_id']}"
     lines = ["ICTHub", "样式预览 · 以下均为示例数据" if preview else title, f"{region} · 参赛区域实时总榜",
              f"赛程：{schedule}", f"快照时间：{stamp}", ""]
     sections = []
     if not test:
+        lines.extend(["关键邮件 · 榜首变化记录及变动前后快照永久保留", ""])
         for event in payload["events"]:
             before, after = event["before"], event["after"]
             lines.extend([f"变化前：{before['name']}，分数 {before['score']}",
@@ -48,12 +49,12 @@ def render_email(payload: dict) -> tuple[str, str, str]:
         lines.append(f"{rank} | {name} | {score}")
         background = "#fff6ef" if rank == 1 else "#ffffff" if rank % 2 else "#fafbfc"
         badge = {1: ("#f5ab39", "#582d00"), 2: ("#e7ebf1", "#4d5b70"), 3: ("#f0ddca", "#7b5130")}.get(rank, ("transparent", "#768092"))
-        table_rows.append(f'''<tr style="background:{background}"><td align="center" style="padding:13px 8px;border-bottom:1px solid #eef0f4"><span style="display:inline-block;width:28px;line-height:28px;text-align:center;border-radius:8px;background:{badge[0]};color:{badge[1]};font-size:13px;font-weight:700">{rank}</span></td><td style="padding:13px 8px;border-bottom:1px solid #eef0f4;color:#252b3a;font-size:14px;overflow-wrap:anywhere;word-break:break-word">{escape(name)}</td><td align="right" style="padding:13px 12px 13px 8px;border-bottom:1px solid #eef0f4;font-size:14px;font-weight:700;color:{'#ce422a' if rank == 1 else '#364258'};font-variant-numeric:tabular-nums;overflow-wrap:anywhere;word-break:break-word">{escape(score)}</td></tr>''')
+        table_rows.append(f'''<tr style="background:{background}"><td align="center" style="padding:13px 8px;border-bottom:1px solid #eef0f4"><span style="display:inline-block;width:28px;line-height:28px;text-align:center;border-radius:8px;background:{badge[0]};color:{badge[1]};font-size:13px;font-weight:700">{rank}</span></td><td class="team-name" style="padding:13px 8px;border-bottom:1px solid #eef0f4;color:#252b3a;font-size:14px;white-space:normal;word-wrap:break-word;overflow-wrap:anywhere;word-break:normal">{escape(name)}</td><td align="right" style="padding:13px 12px 13px 8px;border-bottom:1px solid #eef0f4;font-size:14px;font-weight:700;color:{'#ce422a' if rank == 1 else '#364258'};font-variant-numeric:tabular-nums;overflow-wrap:anywhere;word-break:break-word">{escape(score)}</td></tr>''')
     if not rows:
         empty = f"暂无可展示的{region}快照。启动采集后，通知将在这里展示对应快照的前十名。" if test else "此历史通知的快照未包含可展示的前十名。"
         lines.append(empty)
         table_rows.append(f'<tr><td colspan="3" style="padding:24px 16px;color:#707889;font-size:13px;line-height:1.8">{empty}</td></tr>')
-    note = "样式预览 · 以下均为示例数据" if preview else "测试邮件 · 当前榜单" if test else "榜首队伍或分数发生变化"
+    note = "样式预览 · 以下均为示例数据" if preview else "测试邮件 · 当前榜单" if test else "关键邮件 · 榜首变化快照永久保留"
     lines.extend(["", f"榜单：{url}", "", "发信单位：ICTHub", "采样记录反映已公开的成绩变化。"])
     html = f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(subject)}</title></head>
@@ -71,7 +72,7 @@ def render_email(payload: dict) -> tuple[str, str, str]:
 {''.join(sections)}
 <tr><td style="padding:0 32px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td height="2" bgcolor="#ef7d17" width="24%" style="height:2px;background:#ef7d17"></td><td height="2" bgcolor="#e9edf4" style="height:2px;background:#e9edf4"></td></tr></table></td></tr>
 <tr><td style="padding:24px 32px 12px"><h2 style="margin:0;color:#252b3a;font-size:19px;font-weight:750">{region} · 前十名</h2><p style="margin:7px 0 0;color:#818a99;font-size:12px;line-height:1.6">{'本次测试实时获取的榜单' if test else '与本次榜首变动来自同一次采样'} · 序号按赛事榜单顺序</p></td></tr>
-<tr><td style="padding:0 24px 20px"><table width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed;border-collapse:collapse"><thead><tr style="background:#f1f3f8"><th scope="col" width="15%" style="padding:12px 8px;font-size:12px;font-weight:500;color:#737e91">序号</th><th scope="col" align="left" width="50%" style="padding:12px 8px;font-size:12px;font-weight:500;color:#737e91">队名</th><th scope="col" align="right" width="35%" style="padding:12px 12px 12px 8px;font-size:12px;font-weight:500;color:#737e91">分数</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table></td></tr>
+<tr><td style="padding:0 24px 20px"><table width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed;border-collapse:collapse"><thead><tr style="background:#f1f3f8"><th scope="col" width="12%" style="white-space:nowrap;padding:12px 8px;font-size:12px;font-weight:500;color:#737e91">序号</th><th scope="col" align="left" width="56%" style="white-space:nowrap;padding:12px 8px;font-size:12px;font-weight:500;color:#737e91">队名</th><th scope="col" align="right" width="32%" style="white-space:nowrap;padding:12px 12px 12px 8px;font-size:12px;font-weight:500;color:#737e91">分数</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table></td></tr>
 <tr><td align="center" style="padding:6px 24px 28px"><a href="{escape(url, quote=True)}" style="display:inline-block;background:#6746e8;color:#ffffff;text-decoration:none;border-radius:10px;padding:13px 28px;font-size:14px;font-weight:600">查看实时榜单 →</a></td></tr>
 <tr><td style="padding:20px 32px;background:#fafbfe;border-top:1px solid #edf0f5;color:#8a93a3;font-size:11px;line-height:1.9">发信单位：<strong style="color:#536076">ICTHub</strong><br>本邮件由 BeauClaw 自动生成，采样记录反映已公开的成绩变化。</td></tr>
 </table></td></tr></table></body></html>'''

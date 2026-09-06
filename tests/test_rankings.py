@@ -1,5 +1,6 @@
 import contextlib
 import json
+import io
 import sqlite3
 import tempfile
 import threading
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from beauclaw.auth import save_auth
+from beauclaw.cli import main
 from beauclaw.core import DEFAULT_COMPETITION, Store
 from beauclaw.mail import create_message, deliver_one, load_mail_config, mail_policy, test_mail
 from beauclaw.monitor import Collector
@@ -129,6 +131,48 @@ class RankingTests(unittest.TestCase):
         with patch('beauclaw.mail.fetch') as fetch, patch('beauclaw.mail.send_message') as send:
             with self.assertRaisesRegex(ValueError, 'Rankings is empty'):
                 test_mail(self.root / 'missing-mail-config', self.store)
+        fetch.assert_not_called()
+        send.assert_not_called()
+
+    def test_targeted_test_cli_sends_once_without_modifying_recipients(self):
+        first = self.add()
+        self.add('22222', '第二个比赛')
+        original = self.store.notices()
+        args = ['beauclaw', 'notice', 'test', 'Preview@Example.com', '--db', str(self.db),
+                '--mail-config', str(self.config), '--auth-file', str(self.root/'auth.json')]
+        with patch('sys.argv', args), contextlib.redirect_stdout(io.StringIO()), \
+             patch('beauclaw.mail.fetch', return_value=response(payload([team(f'队{i}', 100-i) for i in range(14)]))) as fetch, \
+             patch('beauclaw.mail.send_message') as send:
+            self.assertEqual(main(), 0)
+        self.assertEqual(fetch.call_args.args[0], first['competition_id'])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[3], 'preview@example.com')
+        message = send.call_args.args[1]
+        self.assertEqual(str(message['To']), 'preview@example.com')
+        self.assertIsNone(message['Importance'])
+        html = message.get_body(preferencelist=('html',)).get_content()
+        self.assertIn('队9', html)
+        self.assertNotIn('队10', html)
+        self.assertNotIn('变化前', html)
+        self.assertEqual(self.store.notices(), original)
+        self.assertEqual(self.store.summary()['poll_count'], 0)
+
+    def test_targeted_test_works_with_an_empty_recipient_list(self):
+        self.add()
+        for notice in self.store.notices():
+            self.store.delete_notice(notice['short_id'])
+        with patch('beauclaw.mail.fetch', return_value=response()), patch('beauclaw.mail.send_message') as send:
+            test_mail(self.config, self.store, auth_file=self.root/'auth.json', recipient='only@example.com')
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(self.store.notices(), [])
+
+    def test_targeted_test_rejects_invalid_address_or_empty_rankings_without_network(self):
+        with patch('beauclaw.mail.fetch') as fetch, patch('beauclaw.mail.send_message') as send:
+            with self.assertRaisesRegex(ValueError, 'complete email address'):
+                test_mail(self.config, self.store, recipient='bad-address')
+            with self.assertRaisesRegex(ValueError, 'Rankings is empty'):
+                test_mail(self.config, self.store, recipient='only@example.com')
         fetch.assert_not_called()
         send.assert_not_called()
 

@@ -213,7 +213,7 @@ def export_events(store: Store, output: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="beauclaw", description="BeauClaw: monitor competition leaderboards every 10 seconds; email ICTHub alerts when a regional leader changes")
+    parser = argparse.ArgumentParser(prog="beauclaw", description="BeauClaw: monitor competition leaderboards every 10 seconds; email ICTHub alerts when a regional leader's score rises or the leading team changes")
     parser.add_argument("--version", action="version", version=f"beauclaw {__version__}")
     parser.add_argument("--no-animation", action="store_true", help="Disable terminal animations")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -243,6 +243,7 @@ def main() -> int:
         if action in ("add", "delete"):
             command.add_argument("addresses", nargs="+", help="Email addresses; delete accepts a six-character ID from notice list")
         if action == "test":
+            command.add_argument("recipient", nargs="?", help="Send only to this email address without adding it to the recipient list; omit to notify everyone")
             command.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
             command.add_argument("--auth-file", type=Path, default=config_dir() / "gitcode.json")
             command.add_argument("--token-file", type=Path)
@@ -341,7 +342,8 @@ def main() -> int:
                             registry.cancel_recipient(email)
                         print(f"Removed: {email}. Pending notifications cancelled across all rankings.")
                 elif args.notice_command == "test":
-                    test_mail(args.mail_config, store, args.auth_file, args.token_file)
+                    test_mail(args.mail_config, store, args.auth_file, args.token_file,
+                              recipient=getattr(args, "recipient", None))
             finally:
                 store.close()
         elif args.command in ("watch", "start"):
@@ -379,7 +381,7 @@ def main() -> int:
             samples = [row["observations"] for row in monitored if row["observations"]]
             if samples:
                 summary = {**samples[0]}
-                for key in ("poll_count", "event_count", "mail_pending", "mail_sent"):
+                for key in ("poll_count", "critical_poll_count", "event_count", "mail_pending", "mail_sent"):
                     summary[key] = sum(item[key] for item in samples)
                 latest = [item["latest"] for item in samples if item["latest"]]
                 summary["latest"] = max(latest, key=lambda item: item["captured_at"]) if latest else None
@@ -395,6 +397,7 @@ def main() -> int:
                     latest = summary["latest"]
                     print(f"Latest sample: {latest['captured_at']} {latest['status']} {latest['error'] or latest['info'].get('reason', '')}")
                     print(f"Snapshots: {summary['poll_count']}; recipients: {summary['notice_count']}; pending mail: {summary['mail_pending']}; SMTP accepted: {summary['mail_sent']}")
+                    print(f"Critical snapshots: {summary['critical_poll_count']} (retained); ordinary snapshot limit: {summary['snapshot_limit']} per ranking; active comparison baselines protected")
                 else:
                     print("No samples recorded yet.")
                 print(f"Monitored rankings: {len(monitored)}")
