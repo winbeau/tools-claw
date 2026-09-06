@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 
 from beauclaw.service import Service
+from beauclaw.core import Store, DEFAULT_COMPETITION
+from beauclaw.rankings import Rankings
 
 
 @unittest.skipUnless(shutil.which("tmux"), "requires tmux")
@@ -20,6 +22,10 @@ class ServiceTests(unittest.TestCase):
         self.env = {**os.environ, "BEAUCLAW_DATA_DIR": str(self.root / "data"),
                     "BEAUCLAW_CONFIG_DIR": str(self.root / "config")}
         self.db = self.root / "data" / "beauclaw.sqlite3"
+        history = Store(self.db, DEFAULT_COMPETITION)
+        history.close()
+        with Rankings(self.db):
+            pass
         self.service = Service(self.db)
         self.token = self.root / "empty-token"
         self.token.write_text("")  # Local validation fails; no remote HTTP or email is sent.
@@ -48,7 +54,7 @@ class ServiceTests(unittest.TestCase):
         self.assertGreater(pid, 1)
         again = self.start()
         self.assertEqual(again.returncode, 0, again.stderr)
-        self.assertIn("已经在运行", again.stdout)
+        self.assertIn("Already running", again.stdout)
         self.assertEqual(json.loads(self.call("status", "--json").stdout)["service"]["pid"], pid)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
@@ -74,20 +80,63 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.service.tmux("has-session", "-t", "other").returncode, 0)
 
     def test_existing_foreground_collector_is_not_reported_as_new_background_worker(self):
-        self.db.parent.mkdir(parents=True)
+        self.db.parent.mkdir(parents=True, exist_ok=True)
         with self.db.with_suffix(self.db.suffix + ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             started = self.start()
         self.assertEqual(started.returncode, 1)
-        self.assertIn("未成功启动", started.stderr)
+        self.assertIn("did not start", started.stderr)
         self.assertFalse(json.loads(self.call("status", "--json").stdout)["service"]["running"])
 
+    def test_running_monitor_picks_up_added_and_deleted_rankings(self):
+        self.assertEqual(self.start().returncode, 0)
+        initial = json.loads(self.call("status", "--json").stdout)
+        original = initial["rankings"][0]
+        added = self.call("ranking", "add", "https://competition.gitcode.com/competition/12345/live-ranking", "--name", "Second fixture")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        deadline = time.monotonic() + 5
+        second = None
+        while time.monotonic() < deadline:
+            state = json.loads(self.call("status", "--json").stdout)
+            second = next((r for r in state["rankings"] if r["competition_id"] == "12345"), None)
+            if second and second["observations"] and second["observations"]["poll_count"]:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(second)
+        self.assertGreater(second["observations"]["poll_count"], 0)
+        self.assertEqual(state["service"]["pid"], initial["service"]["pid"])
+        self.assertEqual(self.call("ranking", "delete", original["short_id"]).returncode, 0)
+        state = json.loads(self.call("status", "--json").stdout)
+        self.assertEqual([r["short_id"] for r in state["rankings"]], [second["short_id"]])
+        self.assertTrue(state["service"]["running"])
+        self.assertTrue(Path(original["db"]).is_file())
+        # Wait until the removed collector releases its history database lock.
+        deadline = time.monotonic() + 5
+        with self.db.with_suffix(self.db.suffix + ".lock").open("a") as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    break
+                except BlockingIOError:
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.1)
+        self.assertEqual(self.call("ranking", "add", original["url"]).returncode, 0)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = json.loads(self.call("status", "--json").stdout)
+            row = next(r for r in state["rankings"] if r["short_id"] == original["short_id"])
+            if row["observations"] and row["observations"]["poll_count"] >= 2:
+                break
+            time.sleep(0.1)
+        self.assertGreaterEqual(row["observations"]["poll_count"], 2)
+
     def test_stale_state_does_not_signal_an_unrelated_pid(self):
-        self.db.parent.mkdir(parents=True)
+        self.db.parent.mkdir(parents=True, exist_ok=True)
         self.service.state_path.write_text(json.dumps({"pid": os.getpid(), "state": "running"}))
         result = self.call("stop")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("当前未运行", result.stdout)
+        self.assertIn("not running", result.stdout)
 
 
 if __name__ == "__main__":

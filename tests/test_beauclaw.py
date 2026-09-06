@@ -296,7 +296,7 @@ class MailTests(unittest.TestCase):
         self.assertEqual(len(data["events"]), 1)
         self.assertNotIn("password", data)
         message = create_message(data, rows[0]["message_id"])
-        text = message.get_content()
+        text = message.get_body(preferencelist=("plain",)).get_content()
         self.assertIn("甲队", text)
         self.assertIn("分数 10", text)
         self.assertIn("分数 11", text)

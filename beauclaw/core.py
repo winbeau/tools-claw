@@ -41,7 +41,7 @@ def competition_id(value: str) -> str:
     import re
     match = re.fullmatch(r"(?:https://competition\.gitcode\.com/competition/)?(\d+)(?:/live-ranking/?(?:\?[^#]*)?)?", value)
     if not match:
-        raise ValueError("请提供赛事数字 ID 或 GitCode 实时榜单链接")
+        raise ValueError("Provide a numeric competition ID or a GitCode live-ranking URL")
     return match[1]
 
 
@@ -87,10 +87,10 @@ def fetch(event_id: str, auth: dict, timeout: float = 8) -> Response:
             body = response.read(20 * 1024 * 1024 + 1)
             if len(body) > 20 * 1024 * 1024:
                 return Response(started, utcnow(), url, response.code, headers=safe_headers,
-                                error="响应超过 20 MiB，未将截断数据用于比较")
+                                error="Response exceeds 20 MiB; truncated data was not compared")
             return Response(started, utcnow(), url, response.code, body, safe_headers)
     except (URLError, OSError, ValueError) as exc:
-        return Response(started, utcnow(), url, None, error=f"网络请求失败：{type(exc).__name__}")
+        return Response(started, utcnow(), url, None, error=f"Network request failed: {type(exc).__name__}")
 
 
 class InvalidBoard(ValueError):
@@ -99,7 +99,7 @@ class InvalidBoard(ValueError):
 
 def score_text(value: Any) -> str:
     if value is None or isinstance(value, bool):
-        raise InvalidBoard("榜单包含缺失或非法分数")
+        raise InvalidBoard("Leaderboard contains a missing or invalid score")
     try:
         number = Decimal(str(value))
         if not number.is_finite():
@@ -110,28 +110,28 @@ def score_text(value: Any) -> str:
             text = text.rstrip("0").rstrip(".")
         return "0" if number == 0 else text
     except (InvalidOperation, ValueError):
-        raise InvalidBoard("榜单包含无法解析的分数") from None
+        raise InvalidBoard("Leaderboard contains an unparseable score") from None
 
 
 def parse_board(body: bytes, observed_at: str) -> dict:
     try:
         payload = json.loads(body, parse_float=str)
     except (ValueError, UnicodeError):
-        raise InvalidBoard("响应不是有效 JSON，可能是登录页或拦截页") from None
+        raise InvalidBoard("Response is not valid JSON; it may be a login or block page") from None
     if not isinstance(payload, dict):
-        raise InvalidBoard("响应结构变化：预期为榜单对象")
+        raise InvalidBoard("Unexpected response structure; expected a leaderboard object")
     for field_name in ("error_code", "code"):
         if field_name in payload and str(payload[field_name]) not in ("0", "200", "None"):
-            raise InvalidBoard(f"接口返回业务错误 {field_name}={payload[field_name]}")
+            raise InvalidBoard(f"API returned a business error {field_name}={payload[field_name]}")
     if "data" in payload and "current_schedule" not in payload:
         payload = payload["data"]
     if not isinstance(payload, dict) or "current_schedule" not in payload:
-        raise InvalidBoard("响应缺少 current_schedule，未用于比较")
+        raise InvalidBoard("Response has no current_schedule and was not compared")
     schedule = payload["current_schedule"]
     if schedule is None:
-        return {"status": "unavailable", "reason": "当前没有可用赛程", "boards": {}}
+        return {"status": "unavailable", "reason": "No schedule is currently available", "boards": {}}
     if not isinstance(schedule, dict) or schedule.get("id") is None:
-        raise InvalidBoard("赛程缺少 ID，无法安全区分不同赛程")
+        raise InvalidBoard("Schedule has no ID; different schedules cannot be separated safely")
     result = {"status": "ok", "schedule_id": str(schedule["id"]),
               "schedule_name": str(schedule.get("name") or schedule["id"]), "boards": {}}
     if schedule.get("seal_time"):
@@ -141,31 +141,31 @@ def parse_board(body: bytes, observed_at: str) -> dict:
             if seal_time.tzinfo is None:
                 seal_time = seal_time.replace(tzinfo=timezone(timedelta(hours=8)))
             if datetime.fromisoformat(observed_at) >= seal_time:
-                return {**result, "status": "sealed", "reason": "当前赛程已封榜"}
+                return {**result, "status": "sealed", "reason": "The current schedule is sealed"}
         except ValueError:
-            raise InvalidBoard("无法解析封榜时间，未用于比较") from None
+            raise InvalidBoard("Invalid seal time; response was not compared") from None
     for board_key in BOARDS:
         rows = payload.get(board_key)
         if not isinstance(rows, list):
-            raise InvalidBoard(f"响应缺少完整的 {board_key} 数组，未用于比较")
+            raise InvalidBoard(f"Response lacks a complete {board_key} array and was not compared")
         members = {}
         for rank, row in enumerate(rows, 1):
             if not isinstance(row, dict):
-                raise InvalidBoard("榜单行结构异常")
+                raise InvalidBoard("Unexpected leaderboard row structure")
             name = str(row.get("team_name") or "").strip()
             if not name or "score" not in row:
-                raise InvalidBoard("榜单行缺少队名或分数，未用于比较")
+                raise InvalidBoard("Leaderboard row lacks a team name or score and was not compared")
             stable_field = next((key for key in ("team_id", "namespace_id")
                                  if row.get(key) is not None and str(row[key]) != ""), None)
             key = f"{stable_field}:{row[stable_field]}" if stable_field else f"name:{name}"
             if key in members:
-                raise InvalidBoard("榜单含重复队伍标识，未用于比较")
+                raise InvalidBoard("Duplicate team identities; response was not compared")
             members[key] = {"key": key, "name": name, "rank": rank,
                             "score": score_text(row["score"]),
                             "identity_basis": stable_field or "team_name"}
         result["boards"][board_key] = members
     if not any(result["boards"].values()):
-        result.update(status="unavailable", reason="两个榜单均为空，保留上一份有效记录")
+        result.update(status="unavailable", reason="Both boards are empty; preserving the previous valid snapshot")
     return result
 
 
@@ -185,7 +185,7 @@ def update_state(state: dict | None, members: dict, context: dict,
     state["latest_poll_id"] = poll_id
     if not members:
         if state["available"]:
-            emit("board_empty", message="整榜为空，保留上次数据，不判定队伍消失")
+            emit("board_empty", message="Board is empty; retaining previous entries without marking teams missing")
         state["available"] = False
         return state, events
     if not state["available"]:
@@ -244,8 +244,9 @@ def update_state(state: dict | None, members: dict, context: dict,
 
 
 class Store:
-    def __init__(self, path: Path, event_id: str | None = None):
+    def __init__(self, path: Path, event_id: str | None = None, notice_db: Path | None = None):
         self.path = Path(path)
+        self.notice_db = Path(notice_db) if notice_db else self.path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=10)
         self.db.row_factory = sqlite3.Row
@@ -276,11 +277,21 @@ class Store:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL);
         """)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if "short_id" not in {row[1] for row in self.db.execute("PRAGMA table_info(notices)")}:
+                self.db.execute("ALTER TABLE notices ADD COLUMN short_id TEXT")
+            used = {row[0] for row in self.db.execute("SELECT short_id FROM notices WHERE short_id IS NOT NULL")}
+            for row in self.db.execute("SELECT id,email FROM notices WHERE short_id IS NULL").fetchall():
+                code = short_code(row["email"], used)
+                used.add(code)
+                self.db.execute("UPDATE notices SET short_id=? WHERE id=?", (code, row["id"]))
+            self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS notices_short_id ON notices(short_id)")
         if event_id:
             existing = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
             if existing and existing[0] != event_id:
                 self.close()
-                raise ValueError("数据库属于另一个赛事，请使用不同的 --db 路径")
+                raise ValueError("Database belongs to another competition; use a different --db path")
             with self.db:
                 self.db.execute("INSERT OR IGNORE INTO meta VALUES ('competition_id', ?)", (event_id,))
 
@@ -295,9 +306,9 @@ class Store:
             status = "error"
         elif response.status != 200:
             status = "error"
-            error = {401: "登录已失效或尚未登录，请运行 login 更新登录凭据",
-                     403: "接口拒绝访问", 418: "请求被站点拦截", 429: "接口限流，稍后重试"}.get(
-                         response.status, f"接口 HTTP {response.status}")
+            error = {401: "Session missing or expired; run beauclaw login",
+                     403: "API access denied", 418: "Request blocked by the site", 429: "API rate limit reached; retrying later"}.get(
+                         response.status, f"API HTTP {response.status}")
         else:
             try:
                 info = parse_board(response.body, response.captured_at)
@@ -342,7 +353,13 @@ class Store:
                     for notice in self.notices():
                         message = {"competition_id": event_id, "captured_at": response.captured_at,
                                    "poll_id": poll_id, "events": leaders, "sender": mail_policy["sender"],
-                                   "recipient": notice["email"], "schedule_name": info["schedule_name"]}
+                                   "recipient": notice["email"], "recipient_id": notice["id"],
+                                   "recipient_created_at": notice["created_at"],
+                                   "schedule_name": info["schedule_name"],
+                                   "competition_name": mail_policy.get("competition_name", "CANN 挑战赛"),
+                                   "ranking_id": mail_policy.get("ranking_id"),
+                                   "ranking_generation": mail_policy.get("ranking_generation"),
+                                   "top10": top_ten(info)}
                         self.db.execute("INSERT INTO mail_outbox (poll_id,recipient,message_id,payload_json) VALUES (?,?,?,?)",
                                         (poll_id, notice["email"], f"<{uuid.uuid4().hex}@beauclaw.local>", dumps(message)))
         return {"id": poll_id, "status": status, "error": error, "captured_at": response.captured_at,
@@ -369,7 +386,7 @@ class Store:
                     "interval_seconds": float(interval[0]) if interval else 10,
                     "mail_pending": self.db.execute("SELECT count(*) FROM mail_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL").fetchone()[0],
                     "mail_sent": self.db.execute("SELECT count(*) FROM mail_outbox WHERE sent_at IS NOT NULL").fetchone()[0],
-                    "notice_count": self.db.execute("SELECT count(*) FROM notices").fetchone()[0],
+                    "notice_count": len(self.notices()),
                     "mail_last_error": (lambda r: r[0] if r else None)(self.db.execute(
                         "SELECT last_error FROM mail_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL AND last_error IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()),
                     "poll_count": self.db.execute("SELECT count(*) FROM polls").fetchone()[0],
@@ -390,21 +407,34 @@ class Store:
         return result
 
     def notices(self) -> list[dict]:
+        if self.notice_db.resolve() != self.path.resolve():
+            connection = sqlite3.connect(self.notice_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+            connection.row_factory = sqlite3.Row
+            try:
+                return [dict(row) for row in connection.execute("SELECT * FROM notices ORDER BY id")]
+            finally:
+                connection.close()
         return [dict(row) for row in self.db.execute("SELECT * FROM notices ORDER BY id")]
 
     def add_notice(self, email: str) -> bool:
         from beauclaw.mail import address
         email = address(email.strip()).lower()
         with self.db:
-            result = self.db.execute("INSERT OR IGNORE INTO notices(email,created_at) VALUES (?,?)", (email, utcnow()))
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.db.execute("SELECT 1 FROM notices WHERE email=?", (email,)).fetchone():
+                return False
+            code = short_code(email, {row[0] for row in self.db.execute("SELECT short_id FROM notices")})
+            result = self.db.execute("INSERT INTO notices(email,created_at,short_id) VALUES (?,?,?)", (email, utcnow(), code))
             return result.rowcount == 1
 
     def delete_notice(self, key: str) -> str:
         with self.db:
-            row = self.db.execute("SELECT * FROM notices WHERE email=? OR CAST(id AS TEXT)=?",
-                                  (key.strip().lower(), key.strip())).fetchone()
+            row = self.db.execute("SELECT * FROM notices WHERE short_id=?", (key.strip().lower(),)).fetchone()
             if row is None:
-                raise ValueError("找不到该通知邮箱，请运行 beauclaw notice list")
+                row = self.db.execute("SELECT * FROM notices WHERE email=? OR CAST(id AS TEXT)=?",
+                                      (key.strip().lower(), key.strip())).fetchone()
+            if row is None:
+                raise ValueError("Recipient ID not found; run beauclaw notice list")
             self.db.execute("DELETE FROM notices WHERE id=?", (row["id"],))
             self.db.execute("UPDATE mail_outbox SET cancelled_at=? WHERE recipient=? AND sent_at IS NULL",
                             (utcnow(), row["email"]))
@@ -420,3 +450,36 @@ class Store:
         for key in ("headers", "info"):
             result[key] = json.loads(result.pop(f"{key}_json"))
         return result
+
+    def ranking_snapshot(self, poll_id: int | None = None) -> dict:
+        if poll_id is None:
+            row = self.db.execute("SELECT id FROM polls WHERE status='ok' ORDER BY id DESC LIMIT 1").fetchone()
+            if row is None:
+                return {}
+            poll_id = row[0]
+        snapshot = self.snapshot(poll_id)
+        if not snapshot:
+            return {}
+        try:
+            board = parse_board(snapshot["raw_body"].encode(), snapshot["captured_at"])
+        except InvalidBoard:
+            return {}
+        event_id = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
+        return {"poll_id": poll_id, "captured_at": snapshot["captured_at"],
+                "competition_id": event_id[0] if event_id else DEFAULT_COMPETITION,
+                "schedule_name": board.get("schedule_name", ""), "top10": top_ten(board)}
+
+
+def top_ten(board: dict) -> list[dict]:
+    members = board.get("boards", {}).get("realtime_region_ranking", {})
+    return [{key: member[key] for key in ("rank", "name", "score")}
+            for member in sorted(members.values(), key=lambda row: row["rank"])[:10]]
+
+
+def short_code(identity: str, used: set[str]) -> str:
+    for salt in range(1_000_000):
+        value = identity if salt == 0 else f"{identity}\0{salt}"
+        code = hashlib.sha256(value.encode()).hexdigest()[:6]
+        if code not in used:
+            return code
+    raise ValueError("Unable to allocate a unique six-character ID")

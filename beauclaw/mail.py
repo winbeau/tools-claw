@@ -12,18 +12,22 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from email.headerregistry import Address
 from email.utils import format_datetime, make_msgid
 from pathlib import Path
 
-from beauclaw.auth import save_auth
-from beauclaw.core import BOARDS, Store, utcnow
+from beauclaw.auth import load_auth, save_auth
+from beauclaw.core import Store, fetch, parse_board, top_ten, utcnow
+from beauclaw.email_template import render_email
+from beauclaw.ui import activity
+from beauclaw.paths import config_dir
 
 PROVIDERS = {"aliyun": {"host": "smtpdm.aliyun.com", "ports": (25, 80, 465), "port": 465}}
 
 
 def address(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[^\s@<>;,]+@[^\s@<>;,]+\.[^\s@<>;,]+", value):
-        raise ValueError("请输入一个完整邮箱地址，例如 name@mail.icthub.top")
+        raise ValueError("Enter a complete email address, for example name@mail.icthub.top")
     return value
 
 
@@ -33,9 +37,9 @@ def read_settings(path: Path) -> dict:
     try:
         config = json.loads(path.read_text())
     except (ValueError, OSError):
-        raise ValueError("无法读取配置，请运行 beauclaw config set") from None
+        raise ValueError("Could not read mail configuration; run beauclaw config set") from None
     if not isinstance(config, dict):
-        raise ValueError("邮件配置需为 JSON 对象")
+        raise ValueError("Mail configuration must be a JSON object")
     return config
 
 
@@ -44,13 +48,13 @@ def load_mail_config(path: Path) -> dict:
     address(config.get("sender"))
     provider = config.get("provider", "aliyun")
     if provider not in PROVIDERS:
-        raise ValueError("当前支持的服务器厂商：aliyun")
+        raise ValueError("Supported mail provider: aliyun")
     port = config.get("port", 465)
     if type(port) is not int or port not in PROVIDERS[provider]["ports"]:
-        raise ValueError("aliyun SMTP 端口支持 25、80、465")
+        raise ValueError("Aliyun SMTP ports: 25, 80, 465")
     password = os.environ.get("BEAUCLAW_SMTP_PASSWORD") or config.get("password")
     if not isinstance(password, str) or not password:
-        raise ValueError("未配置 SMTP 密码，请运行 beauclaw config set mail.password")
+        raise ValueError("SMTP password is missing; run beauclaw config set mail.password")
     return {**config, "provider": provider, "host": PROVIDERS[provider]["host"], "port": port,
             "security": "ssl" if port == 465 else "starttls", "username": config["sender"],
             "password": password, "boards": ["realtime_region_ranking"], "notify_score": True}
@@ -65,50 +69,50 @@ def configure_mail(path: Path, key: str | None = None, value: str | None = None)
     config = read_settings(path)
     if key in (None, "mail"):
         if value is not None:
-            raise ValueError("交互配置不接受额外 value")
+            raise ValueError("Interactive configuration does not accept a value argument")
         if not sys.stdin.isatty():
-            raise ValueError("请在自己的终端运行 beauclaw config set；也可逐项设置 mail.provider / mail.sender / mail.password")
-        provider = input(f"服务器厂商 [{config.get('provider', 'aliyun')}]: ").strip() or config.get("provider", "aliyun")
+            raise ValueError("Run beauclaw config set in an interactive terminal, or set mail.provider / mail.sender / mail.password individually")
+        provider = input(f"Mail provider [{config.get('provider', 'aliyun')}]: ").strip() or config.get("provider", "aliyun")
         if provider not in PROVIDERS:
-            raise ValueError("当前仅支持 aliyun")
-        sender = input(f"发信地址 [{config.get('sender', '')}]: ").strip() or config.get("sender", "")
+            raise ValueError("Only aliyun is currently supported")
+        sender = input(f"Sender address [{config.get('sender', '')}]: ").strip() or config.get("sender", "")
         config.update(provider=provider, sender=address(sender), port=465)
-        print("复用 aliyun 服务设置：smtpdm.aliyun.com:465（SSL）；支持批量邮件发信地址。")
-        print("请使用阿里云邮件推送控制台中为该发信地址设置的 SMTP 密码。")
-        password = getpass.getpass("SMTP 密码（不回显；已有配置时留空保留）: ")
+        print("Using aliyun: smtpdm.aliyun.com:465 (SSL), including batch-mail senders.")
+        print("Use the SMTP password configured for this sender in the Aliyun DirectMail console.")
+        password = getpass.getpass("SMTP password (hidden; leave empty to keep the current password): ")
         if password:
             config["password"] = password
         if not config.get("password") and not os.environ.get("BEAUCLAW_SMTP_PASSWORD"):
-            raise ValueError("未输入 SMTP 密码")
+            raise ValueError("No SMTP password was entered")
     else:
         key = {"mail.provider": "provider", "mail.sender": "sender", "mail.from": "sender",
                "mail.password": "password", "mail.port": "port"}.get(key)
         if key is None:
-            raise ValueError("可设置 mail.provider、mail.sender、mail.password、mail.port")
+            raise ValueError("Supported keys: mail.provider, mail.sender, mail.password, mail.port")
         if key == "password":
             if value is not None:
-                raise ValueError("密码请用 beauclaw config set mail.password 隐藏输入，不要放进命令行")
+                raise ValueError("Use beauclaw config set mail.password for hidden input; do not pass passwords as command arguments")
             if not sys.stdin.isatty():
-                raise ValueError("请在交互终端隐藏输入密码，或使用 BEAUCLAW_SMTP_PASSWORD")
-            value = getpass.getpass("阿里云邮件推送 SMTP 密码（不回显）: ")
+                raise ValueError("Enter the password in an interactive terminal, or set BEAUCLAW_SMTP_PASSWORD")
+            value = getpass.getpass("Aliyun DirectMail SMTP password (hidden): ")
             if not value:
-                raise ValueError("未输入 SMTP 密码")
+                raise ValueError("No SMTP password was entered")
         elif value is None:
-            raise ValueError("该配置项需要一个值")
+            raise ValueError("This setting requires a value")
         if key == "provider" and value not in PROVIDERS:
-            raise ValueError("当前仅支持 aliyun")
+            raise ValueError("Only aliyun is currently supported")
         if key == "sender":
             value = address(value)
         if key == "port":
             try:
                 value = int(value)
             except ValueError:
-                raise ValueError("端口需为 25、80 或 465") from None
+                raise ValueError("Port must be 25, 80, or 465") from None
             if value not in (25, 80, 465):
-                raise ValueError("端口需为 25、80 或 465")
+                raise ValueError("Port must be 25, 80, or 465")
         config[key] = value
     save_auth(path, config)
-    print(f"发信配置已保存：{path}（权限 600）。通知收件人通过 beauclaw notice add 管理。")
+    print(f"Mail configuration saved: {path} (mode 600). Manage recipients with beauclaw notice add.")
 
 
 def show_config(path: Path) -> dict:
@@ -117,38 +121,22 @@ def show_config(path: Path) -> dict:
     port = config.get("port", 465)
     return {"mail.provider": provider, "mail.host": PROVIDERS.get(provider, {}).get("host"),
             "mail.port": port, "mail.security": "ssl" if port == 465 else "starttls",
-            "mail.sender": config.get("sender", "未设置"),
-            "mail.password": "已设置（环境变量）" if os.environ.get("BEAUCLAW_SMTP_PASSWORD") else
-                             "已设置" if config.get("password") else "未设置",
-            "notice.rule": "仅西北赛区榜首队伍或分数变化", "config_file": str(path)}
+            "mail.sender": config.get("sender", "not set"),
+            "mail.password": "set (environment)" if os.environ.get("BEAUCLAW_SMTP_PASSWORD") else
+                             "set" if config.get("password") else "not set",
+            "notice.rule": "Only the regional leader or score changes for each subscribed competition", "config_file": str(path)}
 
 
 def create_message(payload: dict, message_id: str) -> EmailMessage:
     message = EmailMessage()
-    message["From"] = payload["sender"]
+    message["From"] = Address(display_name="ICTHub", addr_spec=payload["sender"])
     message["To"] = payload["recipient"]
     message["Date"] = format_datetime(datetime.now(timezone.utc))
     message["Message-ID"] = message_id
-    if payload.get("test"):
-        message["Subject"] = "[BeauClaw] SMTP 测试邮件"
-        message.set_content("这是一封榜单监控测试邮件。收到此邮件表示 SMTP 发信配置可用。\n")
-        return message
-    events = payload["events"]
-    label = str(payload["schedule_name"]).replace("\r", " ").replace("\n", " ")[:80]
-    message["Subject"] = f"[BeauClaw · 榜一变化] {label} · 快照 #{payload['poll_id']}"
-    observed = datetime.fromisoformat(payload["captured_at"]).astimezone(timezone(timedelta(hours=8)))
-    lines = ["监测到公开榜单的榜首发生变化。", f"采样时间：{observed:%Y-%m-%d %H:%M:%S}（北京时间）",
-             f"赛事 ID：{payload['competition_id']}", f"原始快照编号：{payload['poll_id']}", ""]
-    for event in events:
-        before, after = event["before"], event["after"]
-        board = event["scope"].split(":", 1)[1]
-        lines.extend([f"【{BOARDS[board]}】", f"变化前：{before['name']}，分数 {before['score']}",
-                      f"变化后：{after['name']}，分数 {after['score']}",
-                      f"变化前快照：{event['details']['previous_poll_id']}", ""])
-    lines.extend([f"榜单：https://competition.gitcode.com/competition/{payload['competition_id']}/live-ranking",
-                  "", "完整原始快照保存在采集机的 SQLite 数据库，可按编号查看或导出。",
-                  "这是采样时观测到的变化，不代表有人故意藏榜。"])
-    message.set_content("\n".join(lines))
+    subject, plain, html = render_email(payload)
+    message["Subject"] = subject
+    message.set_content(plain)
+    message.add_alternative(html, subtype="html")
     return message
 
 
@@ -177,9 +165,23 @@ def deliver_one(store: Store, config: dict) -> bool:
     if row is None:
         return False
     payload = json.loads(row["payload_json"])
+    if payload.get("ranking_id"):
+        from beauclaw.rankings import is_active
+        if not is_active(store.notice_db, payload["ranking_id"], payload.get("ranking_generation")):
+            with store.db:
+                store.db.execute("UPDATE mail_outbox SET cancelled_at=? WHERE id=?", (utcnow(), row["id"]))
+            return True
+    current_notice = next((notice for notice in store.notices() if notice["email"] == payload["recipient"]), None)
+    if current_notice is None or (payload.get("recipient_id") and current_notice["id"] != payload["recipient_id"]) or (payload.get("recipient_created_at") and
+                                 current_notice["created_at"] != payload["recipient_created_at"]):
+        with store.db:
+            store.db.execute("UPDATE mail_outbox SET cancelled_at=? WHERE id=?", (utcnow(), row["id"]))
+        return True
+    if "top10" not in payload:
+        payload["top10"] = store.ranking_snapshot(row["poll_id"]).get("top10", [])
     try:
         if payload["sender"] != config["sender"]:
-            raise ValueError("待发送邮件的发件人与当前配置不同")
+            raise ValueError("Queued sender does not match the current mail configuration")
         message = create_message(payload, row["message_id"])
         send_message(config, message, payload["sender"], payload["recipient"])
     except (OSError, smtplib.SMTPException, ValueError) as exc:
@@ -190,27 +192,28 @@ def deliver_one(store: Store, config: dict) -> bool:
         with store.db:
             store.db.execute("UPDATE mail_outbox SET attempts=?,next_attempt=?,last_error=? WHERE id=?",
                              (attempts, time.time() + delay, error, row["id"]))
-        print(f"邮件 #{row['id']} 发送失败：{error}；{delay}s 后重试。", flush=True)
+        print(f"Email #{row['id']} failed: {error}; retry in {delay}s.", flush=True)
     else:
         with store.db:
             store.db.execute("UPDATE mail_outbox SET attempts=attempts+1,sent_at=?,last_error=NULL WHERE id=?",
                              (utcnow(), row["id"]))
-        print(f"榜一变化通知 #{row['id']} 已被 SMTP 服务器接受（快照 #{row['poll_id']}）。", flush=True)
+        print(f"Leader-change email #{row['id']} accepted by SMTP (snapshot #{row['poll_id']}).", flush=True)
     return True
 
 
 class MailWorker(threading.Thread):
-    def __init__(self, db_path: Path, config_path: Path):
+    def __init__(self, db_path: Path, config_path: Path, notice_db: Path | None = None, active=None):
         super().__init__(name="smtp-notifications", daemon=True)
         self.db_path, self.config_path = db_path, config_path
+        self.notice_db, self.active = notice_db, active
         self.stop_event, self.wake = threading.Event(), threading.Event()
 
     def run(self):
-        store = Store(self.db_path)
+        store = Store(self.db_path, notice_db=self.notice_db)
         try:
             while not self.stop_event.is_set():
                 try:
-                    if self.config_path.exists():
+                    if self.config_path.exists() and (self.active is None or self.active()):
                         config = load_mail_config(self.config_path)
                         if deliver_one(store, config):
                             continue
@@ -227,21 +230,39 @@ class MailWorker(threading.Thread):
         self.join(timeout=12)
 
 
-def test_mail(path: Path, store: Store) -> None:
+def test_mail(path: Path, store: Store, auth_file: Path | None = None, token_file: Path | None = None) -> None:
+    from beauclaw.rankings import Rankings
+    with Rankings(store.path) as registry:
+        rankings = registry.list()
+    if not rankings:
+        raise ValueError("Rankings is empty; no leaderboard is being monitored.")
     config = load_mail_config(path)
     notices = store.notices()
     if not notices:
-        raise ValueError("通知列表为空，请先运行 beauclaw notice add 邮箱地址")
+        raise ValueError("The recipient list is empty; run beauclaw notice add EMAIL first")
+    first = rankings[0]
+    with activity(f"Fetching the first ranking: {first['short_id']}-{first['name']}..."):
+        credentials = load_auth(auth_file or config_dir() / "gitcode.json", token_file)
+        response = fetch(first["competition_id"], credentials)
+        if response.error or response.status != 200:
+            raise ValueError(response.error or f"Leaderboard request returned HTTP {response.status}; run beauclaw login")
+        board = parse_board(response.body, response.captured_at)
+        rows = top_ten(board)
+        if board["status"] != "ok" or not rows:
+            raise ValueError("The regional leaderboard is empty or unavailable; no test email was sent")
+    snapshot = {"competition_id": first["competition_id"], "competition_name": first["name"],
+                "captured_at": response.captured_at, "schedule_name": board["schedule_name"], "top10": rows}
     failed = 0
-    for notice in notices:
-        payload = {"test": True, "sender": config["sender"], "recipient": notice["email"]}
+    for index, notice in enumerate(notices, 1):
+        payload = {**snapshot, "test": True, "sender": config["sender"], "recipient": notice["email"]}
         try:
-            send_message(config, create_message(payload, make_msgid(domain="beauclaw.local")),
-                         config["sender"], notice["email"])
+            with activity(f"Sending test email {index}/{len(notices)} to {notice['email']}..."):
+                send_message(config, create_message(payload, make_msgid(domain="beauclaw.local")),
+                             config["sender"], notice["email"])
         except (OSError, smtplib.SMTPException) as exc:
             failed += 1
-            print(f"{notice['email']}：发送失败（{type(exc).__name__}）")
+            print(f"{notice['email']}: delivery failed ({type(exc).__name__})")
         else:
-            print(f"{notice['email']}：测试邮件已被 SMTP 接受")
+            print(f"{notice['email']}: test email accepted by SMTP")
     if failed:
-        raise ValueError(f"{failed} 个收件人的测试邮件未被 SMTP 接受")
+        raise ValueError(f"Test email was not accepted by SMTP for {failed} recipient(s)")

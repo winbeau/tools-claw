@@ -34,7 +34,7 @@ def mark_worker(args, state: str) -> None:
         return
     saved = read_state(path)
     if saved.get("token") != token:
-        raise ValueError("后台任务标识已变化，拒绝覆盖另一任务的状态")
+        raise ValueError("Worker identity changed; refusing to overwrite another worker state")
     saved.update(state=state, pid=os.getpid(), version=__version__)
     saved["started_at" if state == "running" else "stopped_at"] = utcnow()
     save_auth(path, saved)
@@ -52,13 +52,13 @@ class Service:
 
     def tmux(self, *args: str) -> subprocess.CompletedProcess:
         if not shutil.which("tmux"):
-            raise ValueError("缺少 tmux，请重新运行 BeauClaw 安装脚本或安装 tmux")
+            raise ValueError("tmux is missing; reinstall BeauClaw or install tmux")
         env = {key: value for key, value in os.environ.items() if key != "TMUX"}
         try:
             return subprocess.run(["tmux", "-L", self.socket, "-f", "/dev/null", *args],
                                   env=env, capture_output=True, text=True, timeout=10)
         except subprocess.TimeoutExpired:
-            raise ValueError("tmux 控制命令超时，请检查本机 tmux 状态") from None
+            raise ValueError("tmux command timed out; check the local tmux server") from None
 
     def pane_pid(self) -> int | None:
         if not shutil.which("tmux"):
@@ -87,14 +87,16 @@ class Service:
             if current["state"] == "running":
                 return {**current, "already_running": True}
             if current["state"] == "starting":
-                raise ValueError(f"tmux 会话尚未就绪，请查看日志：{self.log_path}")
+                raise ValueError(f"tmux session is not ready; check the log: {self.log_path}")
             token = uuid.uuid4().hex
-            options = ["--db", str(self.db), "--competition", args.competition,
+            options = ["--db", str(self.db),
                        "--interval", str(args.interval), "--timeout", str(args.timeout),
                        "--missing-samples", str(args.missing_samples), "--port", str(args.port),
                        "--auth-file", str(args.auth_file.expanduser().resolve()),
                        "--mail-config", str(args.mail_config.expanduser().resolve()),
                        "--service-token", token, "--service-file", str(self.state_path)]
+            if args.competition:
+                options.extend(["--competition", args.competition])
             if args.token_file:
                 options.extend(["--token-file", str(args.token_file.expanduser().resolve())])
             for flag in ("no_web", "no_mail"):
@@ -107,7 +109,7 @@ class Service:
             result = self.tmux("new-session", "-d", "-s", self.session, "-c", str(self.db.parent),
                                "/bin/sh", "-c", shell)
             if result.returncode:
-                raise ValueError(f"tmux 启动失败：{result.stderr.strip()}")
+                raise ValueError(f"tmux could not start: {result.stderr.strip()}")
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
                 current = self.status()
@@ -116,7 +118,7 @@ class Service:
                 if current["state"] == "stopped":
                     break
                 time.sleep(0.1)
-            raise ValueError(f"后台进程未成功启动，请查看日志：{self.log_path}")
+            raise ValueError(f"Background worker did not start; check the log: {self.log_path}")
 
     def stop(self, timeout: float = 30, force: bool = False) -> bool:
         if not self.db.parent.exists():
@@ -127,7 +129,7 @@ class Service:
             if status["state"] == "stopped":
                 return False
             if not status["running"]:
-                raise ValueError("会话尚未就绪，暂不能安全停止；请稍后重试或查看日志")
+                raise ValueError("Session is not ready to stop; retry shortly or inspect the log")
             # Match the live tmux pane, never signal a PID from an old state file alone.
             pid = status["pid"]
             if self.pane_pid() != pid:
@@ -145,4 +147,4 @@ class Service:
                 result = self.tmux("kill-session", "-t", self.session)
                 if result.returncode == 0 or self.pane_pid() is None:
                     return True
-            raise ValueError("正常停止超时；可查看日志，或运行 beauclaw stop --force 终止专用会话")
+            raise ValueError("Graceful stop timed out; inspect the log or run beauclaw stop --force")

@@ -24,6 +24,8 @@ from beauclaw.mail import MailWorker, configure_mail, load_mail_config, mail_pol
 from beauclaw.paths import config_dir, data_dir
 from beauclaw import __version__
 from beauclaw.service import Service, mark_worker
+from beauclaw.rankings import Rankings, ranking_status
+from beauclaw.ui import activity, set_animation
 
 ROOT = Path(__file__).resolve().parent
 
@@ -66,7 +68,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path.path == "/":
                 self.reply((ROOT / "assets" / "dashboard.html").read_bytes(), "text/html; charset=utf-8")
                 return
-            store = Store(self.db_path)
+            query = parse_qs(path.query)
+            with Rankings(self.db_path) as rankings:
+                rows = rankings.list()
+                if path.path == "/api/rankings":
+                    self.reply(dumps([{key: row[key] for key in ("short_id", "competition_id", "name", "url")} for row in rows]).encode(), "application/json; charset=utf-8")
+                    return
+                selected = rankings.get(query["ranking"][0]) if query.get("ranking") else rows[0] if rows else None
+            store = Store(Path(selected["db"]) if selected else self.db_path, notice_db=self.db_path)
             try:
                 if path.path == "/api/summary":
                     result = store.summary()
@@ -106,12 +115,15 @@ def server_for(db_path: Path, port: int) -> ThreadingHTTPServer:
 
 
 def watch(args) -> int:
+    if args.competition is None:
+        from beauclaw.monitor import watch_all
+        return watch_all(args)
     args.db.parent.mkdir(parents=True, exist_ok=True)
     with args.db.with_suffix(args.db.suffix + ".lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ValueError("已有进程正在采集到此数据库，请不要重复启动") from None
+            raise ValueError("Another collector is already writing to this database") from None
         store = Store(args.db, args.competition)
         with store.db:
             store.db.execute("INSERT OR REPLACE INTO meta VALUES ('interval_seconds',?)", (str(args.interval),))
@@ -123,12 +135,12 @@ def watch(args) -> int:
             if not args.no_web and not args.once:
                 server = server_for(args.db, args.port)
                 threading.Thread(target=server.serve_forever, daemon=True).start()
-                print(f"查看记录：http://127.0.0.1:{server.server_port}", flush=True)
-            print(f"赛事 {args.competition}，采样间隔 {args.interval:g}s，数据库 {args.db}", flush=True)
+                print(f"Dashboard: http://127.0.0.1:{server.server_port}", flush=True)
+            print(f"Competition {args.competition}; interval {args.interval:g}s; database {args.db}", flush=True)
             if not args.no_mail:
                 mail_worker = MailWorker(args.db, args.mail_config)
                 mail_worker.start()
-                print("邮件通知：已配置" if args.mail_config.exists() else "邮件通知：未配置，请运行 beauclaw config set", flush=True)
+                print("Mail notifications: configured" if args.mail_config.exists() else "Mail notifications: not configured; run beauclaw config set", flush=True)
             failures, samples, failed = 0, 0, False
             last_mail_error = None
             mark_worker(args, "running")
@@ -139,7 +151,7 @@ def watch(args) -> int:
                     response = fetch(args.competition, auth, args.timeout)
                 except (OSError, ValueError) as exc:
                     response = Response(utcnow(), utcnow(), "", None,
-                                        error=f"读取本地凭据失败（{type(exc).__name__}），请检查文件或重新登录")
+                                        error=f"Could not read local credentials ({type(exc).__name__}); check the file or sign in again")
                 policy = None
                 if not args.no_mail and args.mail_config.exists():
                     try:
@@ -147,7 +159,7 @@ def watch(args) -> int:
                         last_mail_error = None
                     except ValueError as exc:
                         if str(exc) != last_mail_error:
-                            print(f"邮件通知配置错误：{exc}", flush=True)
+                            print(f"Mail configuration error: {exc}", flush=True)
                         last_mail_error = str(exc)
                 poll, events = store.record(response, args.missing_samples, mail_policy=policy)
                 if mail_worker:
@@ -159,19 +171,19 @@ def watch(args) -> int:
                     f"{key.removeprefix('realtime_')}: {count}" for key, count in poll["info"]["counts"].items())
                 delay = retry_delay(response, failures, args.interval)
                 print(f"[{poll['captured_at']}] #{poll['id']} {poll['status']} {message}"
-                      + (f"；{delay:g}s 后重试" if failed else ""), flush=True)
+                      + (f"; retry in {delay:g}s" if failed else ""), flush=True)
                 for event in events:
                     if event["kind"] == "rank_changed":
                         continue  # All rank changes are persisted; keep the terminal readable.
                     before, after = event["before"], event["after"]
                     change = f" {before['score']} → {after['score']}" if before and after else ""
-                    print(f"  {KINDS[event['kind']]} {event['name']}{change} [{event['scope']}]", flush=True)
+                    print(f"  {event['kind'].replace('_', ' ')} {event['name']}{change} [{event['scope']}]", flush=True)
                 if args.once or (args.samples and samples >= args.samples):
                     break
                 # Fixed start-to-start interval; no overlapping requests or catch-up bursts.
                 wait = delay if failed else max(0, args.interval - (time.monotonic() - started))
                 stop.wait(wait)
-            print("采集已停止，所有已完成快照均已保存。", flush=True)
+            print("Collection stopped. All completed snapshots have been saved.", flush=True)
             return 1 if (args.once or args.samples) and failed else 0
         finally:
             if mail_worker:
@@ -197,77 +209,110 @@ def export_events(store: Store, output: Path) -> None:
                       after.get("rank", ""), event["details_json"]]
             # Protect spreadsheet users from formula-like team names or other text cells.
             writer.writerow(["'" + v if isinstance(v, str) and v.lstrip().startswith(("=", "+", "-", "@")) else v for v in values])
-    print(f"已导出变化记录：{output}")
+    print(f"Exported events: {output}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="beauclaw", description="BeauClaw：每 10 秒监控 CANN 榜单，西北赛区榜一变化时邮件通知")
+    parser = argparse.ArgumentParser(prog="beauclaw", description="BeauClaw: monitor competition leaderboards every 10 seconds; email ICTHub alerts when a regional leader changes")
     parser.add_argument("--version", action="version", version=f"beauclaw {__version__}")
+    parser.add_argument("--no-animation", action="store_true", help="Disable terminal animations")
     commands = parser.add_subparsers(dest="command", required=True)
-    config = commands.add_parser("config", help="配置发信邮箱与服务器厂商")
+    ranking = commands.add_parser("ranking", help="Manage monitored competition leaderboards")
+    ranking_commands = ranking.add_subparsers(dest="ranking_command", required=True)
+    for action in ("add", "list", "delete"):
+        command = ranking_commands.add_parser(action)
+        command.add_argument("--db", type=Path, default=data_dir() / "beauclaw.sqlite3")
+        if action == "add":
+            command.add_argument("url", type=competition_id, help="Competition leaderboard URL")
+            command.add_argument("--name", help="Optional display name")
+        elif action == "delete":
+            command.add_argument("id", help="Six-character ranking ID from ranking list")
+    config = commands.add_parser("config", help="Configure the sender and mail provider")
     config_commands = config.add_subparsers(dest="config_command", required=True)
     for action in ("set", "show"):
         command = config_commands.add_parser(action)
         command.add_argument("--config-file", type=Path, default=config_dir() / "mail.json")
         if action == "set":
-            command.add_argument("key", nargs="?", help="省略时交互配置；支持 mail.provider / mail.sender / mail.password / mail.port")
-            command.add_argument("value", nargs="?", help="密码不能作为参数传入")
-    notice = commands.add_parser("notice", help="管理通知收件邮箱")
+            command.add_argument("key", nargs="?", help="Omit for interactive setup; keys: mail.provider / mail.sender / mail.password / mail.port")
+            command.add_argument("value", nargs="?", help="Passwords cannot be passed as command arguments")
+    notice = commands.add_parser("notice", help="Manage notification recipients")
     notice_commands = notice.add_subparsers(dest="notice_command", required=True)
     for action in ("add", "list", "delete", "test"):
         command = notice_commands.add_parser(action)
         command.add_argument("--db", type=Path, default=data_dir() / "beauclaw.sqlite3")
         if action in ("add", "delete"):
-            command.add_argument("addresses", nargs="+", help="邮箱地址；delete 也接受 list 中的编号")
+            command.add_argument("addresses", nargs="+", help="Email addresses; delete accepts a six-character ID from notice list")
         if action == "test":
             command.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
-    test = commands.add_parser("test", help="向通知列表中所有邮箱发送测试邮件",
-                               description="使用当前 SMTP 配置，向通知列表中所有邮箱各发送一封测试邮件。")
+            command.add_argument("--auth-file", type=Path, default=config_dir() / "gitcode.json")
+            command.add_argument("--token-file", type=Path)
+    test = commands.add_parser("test", help="Send a test email to every notification recipient",
+                               description="Use the current SMTP configuration to send one test email to every notification recipient.")
     test.add_argument("--db", type=Path, default=data_dir() / "beauclaw.sqlite3")
     test.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
+    test.add_argument("--auth-file", type=Path, default=config_dir() / "gitcode.json")
+    test.add_argument("--token-file", type=Path)
     test.set_defaults(notice_command="test")
     for name in ("login", "watch", "start", "stop", "status", "serve", "export", "snapshot"):
         command = commands.add_parser(name)
         if name in ("login", "watch", "start"):
-            command.add_argument("--competition", type=competition_id, default=DEFAULT_COMPETITION, help="赛事 ID 或榜单链接")
+            command.add_argument("--competition", type=competition_id, default=DEFAULT_COMPETITION if name == "login" else None, help="Optional single competition ID or URL; otherwise monitor ranking list")
             command.add_argument("--auth-file", type=Path, default=config_dir() / "gitcode.json")
-            command.add_argument("--token-file", type=Path, help="只含网页 Token 的本地文件")
+            command.add_argument("--token-file", type=Path, help="Local file containing only the web token")
         if name != "login":
             command.add_argument("--db", type=Path, default=data_dir() / "beauclaw.sqlite3")
         if name in ("watch", "start"):
             command.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
         if name == "login":
             modes = command.add_mutually_exclusive_group()
-            modes.add_argument("--browser", action="store_true", help="打开浏览器手动登录，然后自动保存会话")
-            modes.add_argument("--from-gc", action="store_true", help="尝试复用 gc 凭据；赛事接口可能不接受 PAT")
+            modes.add_argument("--browser", action="store_true", help="Open a browser for sign-in and save the verified session")
+            modes.add_argument("--from-gc", action="store_true", help="Try gc credentials; the competition API may not accept personal access tokens")
             command.add_argument("--profile", type=Path, default=data_dir() / "browser-profile")
         if name in ("watch", "start", "serve"):
             command.add_argument("--port", type=int, default=8765)
         if name in ("watch", "start"):
             command.add_argument("--interval", type=float, default=10)
             command.add_argument("--timeout", type=float, default=8)
-            command.add_argument("--missing-samples", type=int, default=2, help="缺席多少份有效非空快照后标为持续未出现")
+            command.add_argument("--missing-samples", type=int, default=2, help="Number of valid nonempty snapshots before confirming a missing team")
             if name == "watch":
-                command.add_argument("--once", action="store_true", help="抓一次，用于验证登录和接口")
-                command.add_argument("--samples", type=int, default=0, help="抓取指定次数后退出，0 为持续运行")
+                command.add_argument("--once", action="store_true", help="Fetch once to check credentials and API access")
+                command.add_argument("--samples", type=int, default=0, help="Exit after this many samples per ranking; 0 runs continuously")
                 command.add_argument("--service-token", help=argparse.SUPPRESS)
                 command.add_argument("--service-file", type=Path, help=argparse.SUPPRESS)
             command.add_argument("--no-web", action="store_true")
-            command.add_argument("--no-mail", action="store_true", help="暂停入队和发送邮件")
+            command.add_argument("--no-mail", action="store_true", help="Disable mail queuing and delivery")
         if name == "stop":
             command.add_argument("--timeout", type=float, default=30)
-            command.add_argument("--force", action="store_true", help="超时后终止 BeauClaw 专用 tmux 会话")
+            command.add_argument("--force", action="store_true", help="Terminate the dedicated BeauClaw tmux session after the timeout")
         if name == "status":
-            command.add_argument("--json", action="store_true", help="输出进程和采样状态 JSON")
+            command.add_argument("--json", action="store_true", help="Output process and sampling status as JSON")
         if name in ("export", "snapshot"):
             command.add_argument("--output", type=Path, required=True)
+            command.add_argument("--ranking", help="Six-character ranking ID to export")
         if name == "snapshot":
             command.add_argument("id", type=int)
     args = parser.parse_args()
+    set_animation(not args.no_animation)
     try:
-        if args.command == "login":
+        if args.command == "ranking":
+            with Rankings(args.db) as registry:
+                if args.ranking_command == "add":
+                    with activity("Loading competition details..."):
+                        row = registry.add(args.url, args.name)
+                    print(f"{row['short_id']}-{row['name']} -> {row['url']}")
+                    print("Ranking enabled. A running monitor will pick it up automatically.")
+                elif args.ranking_command == "delete":
+                    row = registry.delete(args.id)
+                    print(f"Removed {row['short_id']}-{row['name']}. History retained; pending mail cancelled.")
+                else:
+                    rows = registry.list()
+                    for row in rows:
+                        print(f"{row['short_id']}-{row['name']} -> {row['url']}")
+                    if not rows:
+                        print("No rankings configured. Use beauclaw ranking add URL.")
+        elif args.command == "login":
             if args.token_file and (args.browser or args.from_gc):
-                raise ValueError("--token-file 不能与 --browser / --from-gc 同时使用")
+                raise ValueError("--token-file cannot be combined with --browser / --from-gc")
             login(args.competition, args.auth_file, browser=args.browser, from_gc=args.from_gc,
                   token_file=args.token_file, profile=args.profile)
         elif args.command == "config":
@@ -281,40 +326,47 @@ def main() -> int:
                 if args.notice_command == "add":
                     for email in args.addresses:
                         added = store.add_notice(email)
-                        print(f"{'已添加' if added else '已存在'}：{email.strip().lower()}")
+                        row = next(row for row in store.notices() if row['email'] == email.strip().lower())
+                        print(f"{'Added' if added else 'Already present'}: {row['short_id']}-{row['email']}")
                 elif args.notice_command == "list":
                     rows = store.notices()
                     if not rows:
-                        print("通知列表为空。使用 beauclaw notice add 邮箱地址 添加。")
+                        print("No recipients configured. Use beauclaw notice add EMAIL.")
                     for row in rows:
-                        print(f"{row['id']}\t{row['email']}\t{row['created_at']}")
+                        print(f"{row['short_id']}-{row['email']}")
                 elif args.notice_command == "delete":
                     for key in args.addresses:
-                        print(f"已删除：{store.delete_notice(key)}，该邮箱排队中的未发送通知已取消。")
+                        email = store.delete_notice(key)
+                        with Rankings(args.db) as registry:
+                            registry.cancel_recipient(email)
+                        print(f"Removed: {email}. Pending notifications cancelled across all rankings.")
                 elif args.notice_command == "test":
-                    test_mail(args.mail_config, store)
+                    test_mail(args.mail_config, store, args.auth_file, args.token_file)
             finally:
                 store.close()
         elif args.command in ("watch", "start"):
             if not all(math.isfinite(n) and n >= 1 for n in (args.interval, args.timeout)) or args.missing_samples < 1 or getattr(args, "samples", 0) < 0:
-                raise ValueError("间隔和超时需至少 1 秒，缺席样本数需至少 1，采集次数不能为负数")
+                raise ValueError("Interval and timeout must be at least 1 second; missing samples at least 1; sample count nonnegative")
             if not 1 <= args.port <= 65535:
-                raise ValueError("网页端口需在 1 到 65535 之间")
+                raise ValueError("Dashboard port must be between 1 and 65535")
             if args.command == "watch":
                 return watch(args)
-            state = Service(args.db).start(args)
-            print(f"{'已经在运行' if state['already_running'] else '已通过 tmux 启动'}：PID {state['pid']}")
-            print(f"日志：{state['log']}")
+            with activity("Starting the tmux monitor..."):
+                state = Service(args.db).start(args)
+            print(f"{'Already running' if state['already_running'] else 'Started in tmux'}: PID {state['pid']}")
+            print(f"Log: {state['log']}")
             if state["dashboard"]:
-                print(f"查看记录：{state['dashboard']}")
-            print("使用 beauclaw status 查看采样状态，beauclaw stop 停止。")
+                print(f"Dashboard: {state['dashboard']}")
+            print("Use beauclaw status to inspect sampling, or beauclaw stop to stop.")
         elif args.command == "stop":
             if not math.isfinite(args.timeout) or not 1 <= args.timeout <= 60:
-                raise ValueError("停止等待时间需在 1 到 60 秒之间")
-            stopped = Service(args.db).stop(args.timeout, args.force)
-            print("BeauClaw 已停止，历史数据已保留。" if stopped else "BeauClaw 当前未运行。")
+                raise ValueError("Stop timeout must be between 1 and 60 seconds")
+            with activity("Stopping the monitor and saving pending work..."):
+                stopped = Service(args.db).stop(args.timeout, args.force)
+            print("BeauClaw stopped. History retained." if stopped else "BeauClaw is not running.")
         elif args.command == "status":
             state = Service(args.db).status()
+            monitored = ranking_status(args.db)
             summary = None
             if args.db.is_file():
                 store = Store(args.db)
@@ -324,28 +376,49 @@ def main() -> int:
                     summary.pop("kinds")
                 finally:
                     store.close()
+            samples = [row["observations"] for row in monitored if row["observations"]]
+            if samples:
+                summary = {**samples[0]}
+                for key in ("poll_count", "event_count", "mail_pending", "mail_sent"):
+                    summary[key] = sum(item[key] for item in samples)
+                latest = [item["latest"] for item in samples if item["latest"]]
+                summary["latest"] = max(latest, key=lambda item: item["captured_at"]) if latest else None
             if args.json:
-                print(json.dumps({"service": state, "observations": summary}, ensure_ascii=False, indent=2))
+                print(json.dumps({"service": state, "observations": summary, "rankings": monitored}, ensure_ascii=False, indent=2))
             else:
-                print(f"运行状态：{ {'running': '运行中', 'starting': '启动中', 'stopped': '已停止'}[state['state']]} ({state['state']})")
+                print(f"Service: { {'running': 'Running', 'starting': 'Starting', 'stopped': 'Stopped'}[state['state']]} ({state['state']})")
                 if state["pid"]:
-                    print(f"PID：{state['pid']}；启动时间：{state['started_at']}；版本：{state['version']}")
-                    print(f"进入 tmux：{state['attach_command']}")
-                print(f"日志：{state['log']}\n数据库：{state['db']}")
+                    print(f"PID: {state['pid']}; started: {state['started_at']}; version: {state['version']}")
+                    print(f"Attach: {state['attach_command']}")
+                print(f"Log: {state['log']}\nDatabase: {state['db']}")
                 if summary and summary["latest"]:
                     latest = summary["latest"]
-                    print(f"最近采样：{latest['captured_at']} {latest['status']} {latest['error'] or latest['info'].get('reason', '')}")
-                    print(f"快照：{summary['poll_count']}；通知邮箱：{summary['notice_count']}；邮件待发：{summary['mail_pending']}；SMTP 已接受：{summary['mail_sent']}")
+                    print(f"Latest sample: {latest['captured_at']} {latest['status']} {latest['error'] or latest['info'].get('reason', '')}")
+                    print(f"Snapshots: {summary['poll_count']}; recipients: {summary['notice_count']}; pending mail: {summary['mail_pending']}; SMTP accepted: {summary['mail_sent']}")
                 else:
-                    print("尚无采样记录。")
+                    print("No samples recorded yet.")
+                print(f"Monitored rankings: {len(monitored)}")
+                for row in monitored:
+                    latest = (row["observations"] or {}).get("latest")
+                    detail = f"{latest['status']} at {latest['captured_at']}" if latest else "waiting for the first sample"
+                    print(f"  {row['short_id']}-{row['name']}: {detail}")
         else:
             if not args.db.is_file():
-                raise ValueError("尚无数据库，请先运行 watch")
+                raise ValueError("No database found; start monitoring first")
             if args.command == "serve":
                 with server_for(args.db, args.port) as server:
-                    print(f"历史记录：http://127.0.0.1:{server.server_port}（此命令不采集新数据）", flush=True)
+                    print(f"History: http://127.0.0.1:{server.server_port} (history only; no new samples)", flush=True)
                     server.serve_forever()
             else:
+                with Rankings(args.db) as registry:
+                    rows = registry.list()
+                    selected = registry.get(args.ranking) if args.ranking else rows[0] if len(rows) == 1 else None
+                if selected:
+                    args.db = Path(selected["db"])
+                elif len(rows) > 1:
+                    raise ValueError("Choose a ranking to export with --ranking ID")
+                if not args.db.is_file():
+                    raise ValueError("This ranking has no recorded snapshots yet")
                 store = Store(args.db)
                 try:
                     if args.command == "export":
@@ -353,17 +426,17 @@ def main() -> int:
                     elif args.command == "snapshot":
                         data = store.snapshot(args.id)
                         if data is None:
-                            raise ValueError("找不到指定快照")
+                            raise ValueError("Snapshot not found")
                         args.output.parent.mkdir(parents=True, exist_ok=True)
                         args.output.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                        print(f"已导出原始快照：{args.output}")
+                        print(f"Exported raw snapshot: {args.output}")
                 finally:
                     store.close()
     except (ValueError, OSError) as exc:
-        print(f"错误：{exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("已取消。", file=sys.stderr)
+        print("Cancelled.", file=sys.stderr)
         return 130
     return 0
 

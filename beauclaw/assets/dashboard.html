@@ -11,7 +11,7 @@
   <header><div><span class="eyebrow">BEAUCLAW / GITCODE</span><h1>榜单留痕</h1><p class="muted">记录公开成绩的每一次变化，保留曾经出现过的高分。</p></div><a id="source" class="pill" target="_blank" rel="noreferrer">打开原榜单 ↗</a></header>
   <div id="health" class="muted" role="status">正在读取本地记录…</div><p id="mailHealth" class="muted"></p><p id="error" role="alert"></p>
   <div class="stats"><div class="stat"><span class="muted">已存快照</span><strong id="polls">—</strong></div><div class="stat"><span class="muted">该榜曾出现队伍</span><strong id="teams">—</strong></div><div class="stat"><span class="muted">低于观测最高分</span><strong id="below" class="warn">—</strong></div><div class="stat"><span class="muted">最近有效快照未出现</span><strong id="missing" class="warn">—</strong></div></div>
-  <div class="toolbar"><select id="board" aria-label="选择赛程与榜单"><option value="">等待榜单数据</option></select><input id="search" type="search" placeholder="按队名搜索记录" aria-label="按队名搜索"><label><input id="flagged" type="checkbox"> 仅看分数回退 / 未出现队伍</label></div>
+  <div class="toolbar"><select id="ranking" aria-label="选择比赛"><option value="">等待比赛列表</option></select><select id="board" aria-label="选择赛程与榜单"><option value="">等待榜单数据</option></select><input id="search" type="search" placeholder="按队名搜索记录" aria-label="按队名搜索"><label><input id="flagged" type="checkbox"> 仅看分数回退 / 未出现队伍</label></div>
   <section class="panel"><div class="panel-head"><h2>队伍记录</h2><span id="boardInfo" class="muted"></span></div><div class="table-wrap"><table><thead><tr><th>最近排名</th><th>队伍</th><th>最近分数</th><th>观测最高分</th><th>最高分出现时间</th><th>最近出现时间</th><th>状态</th></tr></thead><tbody id="members"></tbody></table><div id="membersEmpty" class="empty">登录并启动采集后，这里会显示记录。</div></div></section>
   <section class="panel"><div class="panel-head"><h2>变化时间线</h2><label><input id="signals" type="checkbox" checked> 只看回退、未出现、重现、改名</label></div><div class="table-wrap"><table><thead><tr><th>采样时间</th><th>变化</th><th>队伍</th><th>详情</th><th>原始快照</th></tr></thead><tbody id="events"></tbody></table><div id="eventsEmpty" class="empty">还没有符合筛选条件的变化。</div></div><div class="footer"><span id="eventInfo" class="muted"></span><div><button id="live" class="hidden">回到最新</button> <button id="more">加载更早记录</button></div></div></section>
   <div class="note">“未出现”和分数回退只是排查线索，也可能来自榜单维护、成绩重算或队伍改名。无法观测从未公开的成绩，以及两次采样之间出现又消失的记录。整个榜单为空、接口报错、封榜时会保留上次有效记录。</div>
@@ -29,7 +29,8 @@ function lowerThan(a,b){ // Scores are decimal strings; compare exactly without 
   const n=Math.max(x.f.length,y.f.length),xs=x.i+x.f.padEnd(n,'0'),ys=y.i+y.f.padEnd(n,'0');
   const cmp=xs.length!==ys.length?Math.sign(xs.length-ys.length):xs===ys?0:xs<ys?-1:1;return x.neg?cmp>0:cmp<0;
 }
-async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw Error('本地服务响应 '+response.status);return response.json();}
+function scoped(path){return path+ (path.includes('?')?'&':'?')+'ranking='+encodeURIComponent($('ranking').value);}
+async function api(path){if(path!=='/api/rankings'&&$('ranking').value)path=scoped(path);const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw Error('本地服务响应 '+response.status);return response.json();}
 function matches(name){return String(name).toLowerCase().includes($('search').value.trim().toLowerCase());}
 function render(){
   if(!summary)return;
@@ -63,14 +64,18 @@ function eventDetail(e){const b=e.before,a=e.after,d=e.details;
 }
 function renderEvents(){
   const visible=timeline.filter(e=>(!$('board').value||e.scope===$('board').value)&&matches(e.name));
-  $('events').innerHTML=visible.map(e=>`<tr><td>${esc(date(e.observed_at))}</td><td class="${flags.has(e.kind)?'warn':'muted'}">${esc(summary.kinds[e.kind]||e.kind)}</td><td class="name">${esc(e.name||'整榜')}</td><td>${esc(eventDetail(e))}</td><td><a href="/api/snapshots/${e.poll_id}" target="_blank" rel="noreferrer">#${e.poll_id} ↗</a>${e.details.last_seen_poll_id?` · <a href="/api/snapshots/${e.details.last_seen_poll_id}" target="_blank" rel="noreferrer">消失前 #${e.details.last_seen_poll_id} ↗</a>`:''}</td></tr>`).join('');
+  $('events').innerHTML=visible.map(e=>`<tr><td>${esc(date(e.observed_at))}</td><td class="${flags.has(e.kind)?'warn':'muted'}">${esc(summary.kinds[e.kind]||e.kind)}</td><td class="name">${esc(e.name||'整榜')}</td><td>${esc(eventDetail(e))}</td><td><a href="${scoped(`/api/snapshots/${e.poll_id}`)}" target="_blank" rel="noreferrer">#${e.poll_id} ↗</a>${e.details.last_seen_poll_id?` · <a href="${scoped(`/api/snapshots/${e.details.last_seen_poll_id}`)}" target="_blank" rel="noreferrer">消失前 #${e.details.last_seen_poll_id} ↗</a>`:''}</td></tr>`).join('');
   $('eventsEmpty').classList.toggle('hidden',visible.length>0);
   $('eventInfo').textContent=`已加载 ${timeline.length} 条，筛选后 ${visible.length} 条 · ${historyPaused?'历史浏览中，时间线已暂停刷新':'搜索范围为已加载的时间线'}`;
   $('more').disabled=timeline.length===0||historyEnd;
 }
 async function refresh(){
   try{
-    summary=await api('/api/summary');
+    const version=filterVersion, rankings=await api('/api/rankings'), chosen=$('ranking').value;
+    if(version!==filterVersion)return;
+    $('ranking').innerHTML=rankings.map(r=>`<option value="${esc(r.short_id)}">${esc(r.short_id+'-'+r.name)}</option>`).join('')||'<option value="">暂无监控比赛</option>';
+    if(rankings.some(r=>r.short_id===chosen))$('ranking').value=chosen;
+    const next=await api('/api/summary');if(version!==filterVersion)return;summary=next;
     if(summary.competition_id)$('source').href=`https://competition.gitcode.com/competition/${summary.competition_id}/live-ranking`;
     const selected=$('board').value, current=summary.latest?.info?.schedule_id||summary.last_valid?.info?.schedule_id;
     const states=[...summary.states].sort((a,b)=>Number(b.schedule_id===current)-Number(a.schedule_id===current)||Number(b.board==='realtime_region_ranking')-Number(a.board==='realtime_region_ranking')||a.scope.localeCompare(b.scope));
@@ -87,6 +92,7 @@ async function loadEvents(older){
   timeline=older?[...timeline,...rows]:rows;
   historyEnd=rows.length<200;renderEvents();
 }
+$('ranking').addEventListener('change',()=>{filterVersion++;summary=null;timeline=[];historyPaused=false;historyEnd=false;$('board').innerHTML='';refresh();});
 for(const id of ['search','flagged','board'])$(id).addEventListener('input',render);
 $('signals').addEventListener('change',()=>{filterVersion++;timeline=[];historyEnd=false;loadEvents(false).catch(e=>$('error').textContent=e.message);});
 $('more').addEventListener('click',()=>{historyPaused=true;filterVersion++;$('live').classList.remove('hidden');loadEvents(true).catch(e=>$('error').textContent=e.message);});
