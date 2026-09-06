@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>榜单留痕 · BeauClaw</title>
+<style>
+:root{color-scheme:dark;--bg:#101315;--panel:#191e21;--line:#30393d;--muted:#9daeb3;--ink:#edf3f3;--accent:#a9ebbc;--warn:#ffc58f;--danger:#ffacac}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1420px;margin:auto;padding:40px 30px 64px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:28px}h1{font-size:30px;line-height:1.2;margin:8px 0 10px;font-weight:650;letter-spacing:-1px}h2{font-size:18px;margin:0}.eyebrow{color:var(--accent);font:12px monospace;letter-spacing:2px}p{margin:6px 0}.muted{color:var(--muted)}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.pill{padding:6px 12px;border:1px solid var(--line);border-radius:30px;white-space:nowrap}.good{color:var(--accent)}.warn{color:var(--warn)}.danger{color:var(--danger)}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0}.stat,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px}.stat{padding:18px 20px}.stat strong{font-size:28px;font-weight:550;display:block;margin-top:4px;font-variant-numeric:tabular-nums}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:24px 0 16px}input,select,button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid #435157;border-radius:7px;padding:8px 12px}input[type=search]{flex:1;min-width:200px}select{max-width:100%}input[type=checkbox]{accent-color:var(--accent)}label{cursor:pointer}button{cursor:pointer}button:hover{border-color:var(--accent)}button:disabled{opacity:.4;cursor:default}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.panel{overflow:hidden;margin-bottom:24px}.panel-head{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;gap:20px;justify-content:space-between;align-items:center;flex-wrap:wrap}.table-wrap{overflow:auto;max-height:590px}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{text-align:left;padding:12px 20px;border-bottom:1px solid #2b3337}th{background:#20272a;color:var(--muted);font-size:12px;font-weight:500;position:sticky;top:0}td.number{font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums}tbody tr:hover{background:#20282a}tbody tr:last-child td{border-bottom:0}.name{max-width:320px;overflow:hidden;text-overflow:ellipsis}.empty{padding:40px;color:var(--muted);text-align:center}.note{border-left:3px solid var(--warn);padding:10px 16px;margin-top:20px;color:var(--muted);background:#201f1b}.footer{display:flex;justify-content:space-between;gap:20px;align-items:center;padding:16px 20px}.hidden{display:none}#error{color:var(--danger)}small{font-size:12px}.scope{font-size:11px;color:var(--muted)}@media(max-width:740px){main{padding:24px 14px}header{align-items:flex-start;flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}th,td{padding:10px 14px}.stat{padding:14px}h1{font-size:27px}.toolbar>*{max-width:100%}.panel-head{padding:14px}.footer{align-items:flex-start;flex-direction:column}}
+</style>
+<main>
+  <header><div><span class="eyebrow">BEAUCLAW / GITCODE</span><h1>榜单留痕</h1><p class="muted">记录公开成绩的每一次变化，保留曾经出现过的高分。</p></div><a id="source" class="pill" target="_blank" rel="noreferrer">打开原榜单 ↗</a></header>
+  <div id="health" class="muted" role="status">正在读取本地记录…</div><p id="mailHealth" class="muted"></p><p id="error" role="alert"></p>
+  <div class="stats"><div class="stat"><span class="muted">已存快照</span><strong id="polls">—</strong></div><div class="stat"><span class="muted">该榜曾出现队伍</span><strong id="teams">—</strong></div><div class="stat"><span class="muted">低于观测最高分</span><strong id="below" class="warn">—</strong></div><div class="stat"><span class="muted">最近有效快照未出现</span><strong id="missing" class="warn">—</strong></div></div>
+  <div class="toolbar"><select id="board" aria-label="选择赛程与榜单"><option value="">等待榜单数据</option></select><input id="search" type="search" placeholder="按队名搜索记录" aria-label="按队名搜索"><label><input id="flagged" type="checkbox"> 仅看分数回退 / 未出现队伍</label></div>
+  <section class="panel"><div class="panel-head"><h2>队伍记录</h2><span id="boardInfo" class="muted"></span></div><div class="table-wrap"><table><thead><tr><th>最近排名</th><th>队伍</th><th>最近分数</th><th>观测最高分</th><th>最高分出现时间</th><th>最近出现时间</th><th>状态</th></tr></thead><tbody id="members"></tbody></table><div id="membersEmpty" class="empty">登录并启动采集后，这里会显示记录。</div></div></section>
+  <section class="panel"><div class="panel-head"><h2>变化时间线</h2><label><input id="signals" type="checkbox" checked> 只看回退、未出现、重现、改名</label></div><div class="table-wrap"><table><thead><tr><th>采样时间</th><th>变化</th><th>队伍</th><th>详情</th><th>原始快照</th></tr></thead><tbody id="events"></tbody></table><div id="eventsEmpty" class="empty">还没有符合筛选条件的变化。</div></div><div class="footer"><span id="eventInfo" class="muted"></span><div><button id="live" class="hidden">回到最新</button> <button id="more">加载更早记录</button></div></div></section>
+  <div class="note">“未出现”和分数回退只是排查线索，也可能来自榜单维护、成绩重算或队伍改名。无法观测从未公开的成绩，以及两次采样之间出现又消失的记录。整个榜单为空、接口报错、封榜时会保留上次有效记录。</div>
+  <p class="muted"><small id="timezone"></small><small> · 此页面每 3 秒读取本地数据库，赛事接口默认每 10 秒采样一次。</small></p>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const date=value=>value?new Date(value).toLocaleString('zh-CN',{hour12:false}):'—';
+const flags=new Set(['score_drop','missing','missing_confirmed','returned','renamed','leader_changed']);
+let summary=null, timeline=[], filterVersion=0, historyPaused=false, historyEnd=false;
+function lowerThan(a,b){ // Scores are decimal strings; compare exactly without Number rounding.
+  function parts(v){v=String(v);const neg=v.startsWith('-');if(neg)v=v.slice(1);let [i,f='']=v.split('.');return {neg,i:i.replace(/^0+(?=\d)/,''),f};}
+  const x=parts(a),y=parts(b);if(x.neg!==y.neg)return x.neg;
+  const n=Math.max(x.f.length,y.f.length),xs=x.i+x.f.padEnd(n,'0'),ys=y.i+y.f.padEnd(n,'0');
+  const cmp=xs.length!==ys.length?Math.sign(xs.length-ys.length):xs===ys?0:xs<ys?-1:1;return x.neg?cmp>0:cmp<0;
+}
+async function api(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw Error('本地服务响应 '+response.status);return response.json();}
+function matches(name){return String(name).toLowerCase().includes($('search').value.trim().toLowerCase());}
+function render(){
+  if(!summary)return;
+  const latest=summary.latest, good=summary.last_valid, state=summary.states.find(s=>s.scope===$('board').value);
+  $('polls').textContent=summary.poll_count.toLocaleString();
+  if(latest){const age=Math.max(0,Math.round((Date.now()-new Date(latest.captured_at))/1000));
+    const labels={ok:'采样成功',error:'采样失败',sealed:'赛程已封榜',unavailable:'榜单暂不可用'};
+    const stale=age>Math.max(30,summary.interval_seconds*3);
+    $('health').innerHTML=`<span class="${latest.status==='ok'&&!stale?'good':'warn'}">● ${esc(labels[latest.status]||latest.status)}</span> · 最后采样 ${esc(date(latest.captured_at))}（${age}s 前）${stale?' · 暂无新样本，请检查采集进程':''} · ${esc(latest.error||latest.info.reason||'')}`;
+  }else $('health').textContent='尚无快照，请先登录并启动采集。';
+  $('mailHealth').textContent=`邮件通知：${summary.notice_count} 个通知邮箱 · SMTP 已接受 ${summary.mail_sent} 封 · 待发送 ${summary.mail_pending} 封${summary.mail_last_error?' · 最近错误：'+summary.mail_last_error:''}`;
+  const members=Object.values(state?.members||{}), below=m=>lowerThan(m.entry.score,m.peak_score);
+  $('teams').textContent=members.length;$('below').textContent=members.filter(below).length;$('missing').textContent=members.filter(m=>!m.present).length;
+  $('boardInfo').textContent=state?`${state.available?'最近有效数据':'整榜暂不可用，展示历史数据'}：${date(state.last_valid_at)}`:'';
+  const visible=members.filter(m=>matches(m.entry.name)&&(!$('flagged').checked||!m.present||below(m))).sort((a,b)=>Number(b.present)-Number(a.present)||a.entry.rank-b.entry.rank);
+  $('members').innerHTML=visible.map(m=>`<tr><td class="number">${m.present?m.entry.rank:'—'}</td><td class="name" title="${esc(m.entry.name)}">${esc(m.entry.name)}</td><td class="number ${below(m)?'warn':''}">${esc(m.entry.score)}</td><td class="number good">${esc(m.peak_score)}</td><td>${esc(date(m.peak_at))}</td><td>${esc(date(m.last_seen))}</td><td class="${!m.present||below(m)?'warn':'muted'}">${!m.present?`未出现 · ${m.missing_count} 份有效快照`:below(m)?'低于观测最高分':'最近快照中在榜'}</td></tr>`).join('');
+  $('membersEmpty').classList.toggle('hidden',visible.length>0);
+  $('membersEmpty').textContent=state?'没有符合筛选条件的队伍。':'登录并启动采集后，这里会显示记录。';
+  renderEvents();
+}
+function eventDetail(e){const b=e.before,a=e.after,d=e.details;
+  if(e.kind==='leader_changed')return `${b.name}（${b.score}）→ ${a.name}（${a.score}）`;
+  if(e.kind==='score_up'||e.kind==='score_drop')return `${b.score} → ${a.score}`;
+  if(e.kind==='rank_changed')return `第 ${b.rank} 名 → 第 ${a.rank} 名`;
+  if(e.kind==='renamed')return `${b.name} → ${a.name}`;
+  if(e.kind==='missing'||e.kind==='missing_confirmed')return `最后分数 ${b.score}，最近出现 ${date(d.last_seen)}${d.samples?`，已缺席 ${d.samples} 份有效快照`:''}`;
+  if(e.kind==='returned')return `重新出现，分数 ${a.score}`;
+  if(e.kind==='appeared')return `分数 ${a.score}，第 ${a.rank} 名`;
+  if(e.kind==='baseline')return `首次记录 ${d.count} 支队伍`;
+  return d.message||'榜单重新有数据';
+}
+function renderEvents(){
+  const visible=timeline.filter(e=>(!$('board').value||e.scope===$('board').value)&&matches(e.name));
+  $('events').innerHTML=visible.map(e=>`<tr><td>${esc(date(e.observed_at))}</td><td class="${flags.has(e.kind)?'warn':'muted'}">${esc(summary.kinds[e.kind]||e.kind)}</td><td class="name">${esc(e.name||'整榜')}</td><td>${esc(eventDetail(e))}</td><td><a href="/api/snapshots/${e.poll_id}" target="_blank" rel="noreferrer">#${e.poll_id} ↗</a>${e.details.last_seen_poll_id?` · <a href="/api/snapshots/${e.details.last_seen_poll_id}" target="_blank" rel="noreferrer">消失前 #${e.details.last_seen_poll_id} ↗</a>`:''}</td></tr>`).join('');
+  $('eventsEmpty').classList.toggle('hidden',visible.length>0);
+  $('eventInfo').textContent=`已加载 ${timeline.length} 条，筛选后 ${visible.length} 条 · ${historyPaused?'历史浏览中，时间线已暂停刷新':'搜索范围为已加载的时间线'}`;
+  $('more').disabled=timeline.length===0||historyEnd;
+}
+async function refresh(){
+  try{
+    summary=await api('/api/summary');
+    if(summary.competition_id)$('source').href=`https://competition.gitcode.com/competition/${summary.competition_id}/live-ranking`;
+    const selected=$('board').value, current=summary.latest?.info?.schedule_id||summary.last_valid?.info?.schedule_id;
+    const states=[...summary.states].sort((a,b)=>Number(b.schedule_id===current)-Number(a.schedule_id===current)||Number(b.board==='realtime_region_ranking')-Number(a.board==='realtime_region_ranking')||a.scope.localeCompare(b.scope));
+    $('board').innerHTML=states.map(s=>`<option value="${esc(s.scope)}">${esc(s.schedule_name)} / ${esc(s.title)}${s.schedule_id===current?'':'（历史赛程）'}</option>`).join('')||'<option value="">等待榜单数据</option>';
+    if(states.some(s=>s.scope===selected))$('board').value=selected;
+    if(!historyPaused)await loadEvents(false);$('error').textContent='';render();
+  }catch(error){$('error').textContent='读取失败：'+error.message+'。请确认采集或 serve 进程仍在运行。';}
+}
+async function loadEvents(older){
+  const version=filterVersion, before=older&&timeline.length?`&before=${Math.min(...timeline.map(e=>e.id))}`:'';
+  const rows=await api(`/api/events?signals=${$('signals').checked?'1':'0'}${before}`);
+  if(version!==filterVersion)return;
+  // Each normal refresh shows a fresh contiguous page; load-more extends it on demand.
+  timeline=older?[...timeline,...rows]:rows;
+  historyEnd=rows.length<200;renderEvents();
+}
+for(const id of ['search','flagged','board'])$(id).addEventListener('input',render);
+$('signals').addEventListener('change',()=>{filterVersion++;timeline=[];historyEnd=false;loadEvents(false).catch(e=>$('error').textContent=e.message);});
+$('more').addEventListener('click',()=>{historyPaused=true;filterVersion++;$('live').classList.remove('hidden');loadEvents(true).catch(e=>$('error').textContent=e.message);});
+$('live').addEventListener('click',()=>{historyPaused=false;filterVersion++;historyEnd=false;$('live').classList.add('hidden');loadEvents(false).catch(e=>$('error').textContent=e.message);});
+$('timezone').textContent='显示时区：'+Intl.DateTimeFormat().resolvedOptions().timeZone+'；数据库时间为 UTC';
+async function loop(){await refresh();setTimeout(loop,3000);}loop();
+</script>
+</html>
