@@ -17,7 +17,7 @@ from email.utils import format_datetime, make_msgid
 from pathlib import Path
 
 from beauclaw.auth import load_auth, save_auth
-from beauclaw.core import Store, fetch, parse_board, should_notify_leader, top_ten, utcnow
+from beauclaw.core import Store, fetch, should_notify_leader, top_ten, utcnow
 from beauclaw.email_template import render_email
 from beauclaw.ui import activity
 from beauclaw.paths import config_dir
@@ -60,9 +60,10 @@ def load_mail_config(path: Path) -> dict:
             "password": password, "boards": ["realtime_region_ranking"]}
 
 
-def mail_policy(config: dict) -> dict:
+def mail_policy(config: dict, provider: str = "gitcode") -> dict:
+    from beauclaw.providers import get_provider
     # Only routing and notification preferences may be saved with observations.
-    return {key: config[key] for key in ("sender", "boards")}
+    return {"sender": config["sender"], "boards": [get_provider(provider).primary_board]}
 
 
 def configure_mail(path: Path, key: str | None = None, value: str | None = None) -> None:
@@ -124,7 +125,7 @@ def show_config(path: Path) -> dict:
             "mail.sender": config.get("sender", "not set"),
             "mail.password": "set (environment)" if os.environ.get("BEAUCLAW_SMTP_PASSWORD") else
                              "set" if config.get("password") else "not set",
-            "notice.rule": "Only a regional leader's score rise or a change of leading team; score drops remain critical records", "config_file": str(path)}
+            "notice.rule": "Only the monitored leader's score rise or a change of leading team; score drops remain critical records", "config_file": str(path)}
 
 
 def create_message(payload: dict, message_id: str) -> EmailMessage:
@@ -240,29 +241,34 @@ class MailWorker(threading.Thread):
 
 
 def test_mail(path: Path, store: Store, auth_file: Path | None = None, token_file: Path | None = None,
-              recipient: str | None = None) -> None:
+              recipient: str | None = None, ranking_id: str | None = None) -> None:
     from beauclaw.rankings import Rankings
+    from beauclaw.providers import get_provider
     if recipient is not None:
         recipient = address(recipient.strip()).lower()
     with Rankings(store.path) as registry:
         rankings = registry.list()
+        selected = registry.get(ranking_id) if ranking_id and rankings else None
     if not rankings:
         raise ValueError("Rankings is empty; no leaderboard is being monitored.")
     config = load_mail_config(path)
     notices = [{"email": recipient}] if recipient is not None else store.notices()
     if not notices:
         raise ValueError("The recipient list is empty; run beauclaw notice add EMAIL first")
-    first = rankings[0]
-    with activity(f"Fetching the first ranking: {first['short_id']}-{first['name']}..."):
-        credentials = load_auth(auth_file or config_dir() / "gitcode.json", token_file)
-        response = fetch(first["competition_id"], credentials)
+    first = selected or rankings[0]
+    source = get_provider(first["provider"])
+    with activity(f"Fetching {'selected' if selected else 'first'} ranking: {first['short_id']}-{first['name']}..."):
+        credentials = load_auth(auth_file or config_dir() / "gitcode.json", token_file) if source.requires_login else {}
+        fetcher = fetch if source.id == "gitcode" else source.fetch
+        response = fetcher(first["competition_id"], credentials)
         if response.error or response.status != 200:
-            raise ValueError(response.error or f"Leaderboard request returned HTTP {response.status}; run beauclaw login")
-        board = parse_board(response.body, response.captured_at)
+            raise ValueError(response.error or f"Leaderboard request returned HTTP {response.status}")
+        board = source.parse(response.body, response.captured_at)
         rows = top_ten(board)
         if board["status"] != "ok" or not rows:
-            raise ValueError("The regional leaderboard is empty or unavailable; no test email was sent")
-    snapshot = {"competition_id": first["competition_id"], "competition_name": first["name"],
+            raise ValueError("The monitored leaderboard is empty or unavailable; no test email was sent")
+    snapshot = {"competition_id": first["competition_id"], "provider": source.id,
+                "source_url": first["url"], "competition_name": first["name"],
                 "captured_at": response.captured_at, "schedule_name": board["schedule_name"], "top10": rows}
     failed = 0
     for index, notice in enumerate(notices, 1):

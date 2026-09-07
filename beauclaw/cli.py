@@ -72,10 +72,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             with Rankings(self.db_path) as rankings:
                 rows = rankings.list()
                 if path.path == "/api/rankings":
-                    self.reply(dumps([{key: row[key] for key in ("short_id", "competition_id", "name", "url")} for row in rows]).encode(), "application/json; charset=utf-8")
+                    self.reply(dumps([{key: row[key] for key in ("short_id", "competition_id", "provider", "name", "url")} for row in rows]).encode(), "application/json; charset=utf-8")
                     return
                 selected = rankings.get(query["ranking"][0]) if query.get("ranking") else rows[0] if rows else None
-            store = Store(Path(selected["db"]) if selected else self.db_path, notice_db=self.db_path)
+            store = Store(Path(selected["db"]) if selected else self.db_path, notice_db=self.db_path,
+                          provider=selected["provider"] if selected else None)
             try:
                 if path.path == "/api/summary":
                     result = store.summary()
@@ -213,7 +214,7 @@ def export_events(store: Store, output: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="beauclaw", description="BeauClaw: monitor competition leaderboards every 10 seconds; email ICTHub alerts when a regional leader's score rises or the leading team changes")
+    parser = argparse.ArgumentParser(prog="beauclaw", description="BeauClaw: monitor GitCode and Aliyun Tianchi leaderboards every 10 seconds; email ICTHub alerts when the leader's score rises or the leading team changes")
     parser.add_argument("--version", action="version", version=f"beauclaw {__version__}")
     parser.add_argument("--no-animation", action="store_true", help="Disable terminal animations")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -223,7 +224,7 @@ def main() -> int:
         command = ranking_commands.add_parser(action)
         command.add_argument("--db", type=Path, default=data_dir() / "beauclaw.sqlite3")
         if action == "add":
-            command.add_argument("url", type=competition_id, help="Competition leaderboard URL")
+            command.add_argument("url", help="GitCode live-ranking URL or Aliyun Tianchi rankingList URL")
             command.add_argument("--name", help="Optional display name")
         elif action == "delete":
             command.add_argument("id", help="Six-character ranking ID from ranking list")
@@ -244,6 +245,7 @@ def main() -> int:
             command.add_argument("addresses", nargs="+", help="Email addresses; delete accepts a six-character ID from notice list")
         if action == "test":
             command.add_argument("recipient", nargs="?", help="Send only to this email address without adding it to the recipient list; omit to notify everyone")
+            command.add_argument("--ranking", help="Use this six-character ranking ID; defaults to the first ranking")
             command.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
             command.add_argument("--auth-file", type=Path, default=config_dir() / "gitcode.json")
             command.add_argument("--token-file", type=Path)
@@ -253,11 +255,12 @@ def main() -> int:
     test.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
     test.add_argument("--auth-file", type=Path, default=config_dir() / "gitcode.json")
     test.add_argument("--token-file", type=Path)
+    test.add_argument("--ranking", help="Use this six-character ranking ID; defaults to the first ranking")
     test.set_defaults(notice_command="test")
     for name in ("login", "watch", "start", "stop", "status", "serve", "export", "snapshot"):
         command = commands.add_parser(name)
         if name in ("login", "watch", "start"):
-            command.add_argument("--competition", type=competition_id, default=DEFAULT_COMPETITION if name == "login" else None, help="Optional single competition ID or URL; otherwise monitor ranking list")
+            command.add_argument("--competition", type=competition_id, default=DEFAULT_COMPETITION if name == "login" else None, help="Legacy single GitCode competition ID or URL; otherwise monitor all providers in ranking list")
             command.add_argument("--auth-file", type=Path, default=config_dir() / "gitcode.json")
             command.add_argument("--token-file", type=Path, help="Local file containing only the web token")
         if name != "login":
@@ -343,7 +346,7 @@ def main() -> int:
                         print(f"Removed: {email}. Pending notifications cancelled across all rankings.")
                 elif args.notice_command == "test":
                     test_mail(args.mail_config, store, args.auth_file, args.token_file,
-                              recipient=getattr(args, "recipient", None))
+                              recipient=getattr(args, "recipient", None), ranking_id=args.ranking)
             finally:
                 store.close()
         elif args.command in ("watch", "start"):

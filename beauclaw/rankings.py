@@ -6,7 +6,9 @@ import sqlite3
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from beauclaw.core import API_ORIGIN, DEFAULT_COMPETITION, Store, competition_id, short_code, utcnow
+from beauclaw.core import API_ORIGIN, DEFAULT_COMPETITION, Store, short_code, utcnow
+from beauclaw.providers import parse_target
+from beauclaw import tianchi
 
 DEFAULT_TITLE = "2026年CANN挑战赛_西北赛区"
 
@@ -41,6 +43,18 @@ class Rankings:
             self.db.execute("BEGIN IMMEDIATE")
             if "generation" not in {row[1] for row in self.db.execute("PRAGMA table_info(rankings)")}:
                 self.db.execute("ALTER TABLE rankings ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+            if "provider" not in {row[1] for row in self.db.execute("PRAGMA table_info(rankings)")}:
+                # Preserve IDs, ordering, deleted subscriptions and generations while
+                # replacing the old global competition_id uniqueness constraint.
+                self.db.execute("""CREATE TABLE rankings_multisource (
+                    short_id TEXT PRIMARY KEY, competition_id TEXT NOT NULL,
+                    name TEXT NOT NULL, url TEXT NOT NULL, storage TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+                    generation INTEGER NOT NULL DEFAULT 1, provider TEXT NOT NULL DEFAULT 'gitcode',
+                    UNIQUE(provider,competition_id))""")
+                self.db.execute("INSERT INTO rankings_multisource SELECT short_id,competition_id,name,url,storage,active,created_at,generation,'gitcode' FROM rankings")
+                self.db.execute("DROP TABLE rankings")
+                self.db.execute("ALTER TABLE rankings_multisource RENAME TO rankings")
         if not self.db.execute("SELECT 1 FROM meta WHERE key='ranking_registry_initialized'").fetchone():
             previous = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
             if previous:
@@ -73,24 +87,25 @@ class Rankings:
         return self.row(row)
 
     def add(self, url: str, name: str | None = None, legacy: bool = False) -> dict:
-        event_id = competition_id(url)
-        canonical = f"https://competition.gitcode.com/competition/{event_id}/live-ranking"
-        existing = self.db.execute("SELECT * FROM rankings WHERE competition_id=?", (event_id,)).fetchone()
+        provider, event_id = parse_target(url)
+        canonical = provider.url(event_id)
+        identity = (provider.id, event_id)
+        existing = self.db.execute("SELECT * FROM rankings WHERE provider=? AND competition_id=?", identity).fetchone()
         if existing:
             with self.db:
-                self.db.execute("UPDATE rankings SET generation=generation+CASE WHEN active=0 THEN 1 ELSE 0 END,active=1 WHERE competition_id=?", (event_id,))
+                self.db.execute("UPDATE rankings SET generation=generation+CASE WHEN active=0 THEN 1 ELSE 0 END,active=1 WHERE provider=? AND competition_id=?", identity)
             return self.get(existing["short_id"])
-        title = name or competition_title(event_id)
+        title = name or (tianchi.competition_title(event_id) if provider.id == "tianchi" else competition_title(event_id))
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            existing = self.db.execute("SELECT * FROM rankings WHERE competition_id=?", (event_id,)).fetchone()
+            existing = self.db.execute("SELECT * FROM rankings WHERE provider=? AND competition_id=?", identity).fetchone()
             if existing:
-                self.db.execute("UPDATE rankings SET generation=generation+CASE WHEN active=0 THEN 1 ELSE 0 END,active=1 WHERE competition_id=?", (event_id,))
+                self.db.execute("UPDATE rankings SET generation=generation+CASE WHEN active=0 THEN 1 ELSE 0 END,active=1 WHERE provider=? AND competition_id=?", identity)
                 return self.get(existing["short_id"])
             code = short_code(canonical, {row[0] for row in self.db.execute("SELECT short_id FROM rankings")})
-            self.db.execute("INSERT INTO rankings(short_id,competition_id,name,url,storage,active,created_at) VALUES (?,?,?,?,?,?,?)",
+            self.db.execute("INSERT INTO rankings(short_id,competition_id,name,url,storage,active,created_at,provider) VALUES (?,?,?,?,?,?,?,?)",
                             (code, event_id, title, canonical,
-                             "" if legacy else f"rankings/{code}.sqlite3", 1, utcnow()))
+                             "" if legacy else f"rankings/{code}.sqlite3", 1, utcnow(), provider.id))
         return self.get(code)
 
     def delete(self, code: str) -> dict:
@@ -135,7 +150,7 @@ def ranking_status(db: Path) -> list[dict]:
         for row in registry.list():
             summary = None
             if Path(row["db"]).is_file():
-                history = Store(Path(row["db"]), notice_db=db)
+                history = Store(Path(row["db"]), notice_db=db, provider=row["provider"])
                 try:
                     summary = history.summary()
                     summary.pop("states")

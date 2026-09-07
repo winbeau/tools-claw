@@ -1,7 +1,7 @@
 [project]
 name = "beauclaw"
-version = "0.3.1"
-description = "GitCode CANN 榜单快照与变化监控"
+version = "0.4.0"
+description = "GitCode 与阿里云天池榜单快照与变化监控"
 requires-python = "==3.12.*"
 dependencies = []
 

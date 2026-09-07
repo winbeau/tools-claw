@@ -13,12 +13,12 @@
 try{document.documentElement.dataset.theme=localStorage.getItem('beauclaw-theme')==='dark'?'dark':'light';}catch{document.documentElement.dataset.theme='light';}
 </script>
 <main>
-  <header><div><span class="eyebrow">BEAUCLAW / GITCODE</span><h1>榜单留痕</h1><p class="muted">记录公开成绩的每一次变化，保留曾经出现过的高分。</p></div><div class="header-actions"><button id="theme" class="pill" type="button" aria-label="切换黑色主题" aria-pressed="false">关灯 · 黑色</button><a id="source" class="pill" target="_blank" rel="noreferrer">打开原榜单 ↗</a></div></header>
+  <header><div><span id="providerLabel" class="eyebrow">BEAUCLAW</span><h1>榜单留痕</h1><p class="muted">记录公开成绩的每一次变化，保留曾经出现过的高分。</p></div><div class="header-actions"><button id="theme" class="pill" type="button" aria-label="切换黑色主题" aria-pressed="false">关灯 · 黑色</button><a id="source" class="pill" target="_blank" rel="noreferrer">打开原榜单 ↗</a></div></header>
   <div id="health" class="muted" role="status">正在读取本地记录…</div><p id="mailHealth" class="muted"></p><p id="error" role="alert"></p>
   <div class="stats"><div class="stat"><span class="muted">已存快照</span><strong id="polls">—</strong></div><div class="stat"><span class="muted">该榜曾出现队伍</span><strong id="teams">—</strong></div><div class="stat"><span class="muted">低于观测最高分</span><strong id="below" class="warn">—</strong></div><div class="stat"><span class="muted">最近有效快照未出现</span><strong id="missing" class="warn">—</strong></div></div>
   <p id="retention" class="muted"></p>
   <div class="toolbar"><select id="ranking" aria-label="选择比赛"><option value="">等待比赛列表</option></select><select id="board" aria-label="选择赛程与榜单"><option value="">等待榜单数据</option></select><input id="search" type="search" placeholder="按队名搜索记录" aria-label="按队名搜索"><label><input id="flagged" type="checkbox"> 仅看分数回退 / 未出现队伍</label></div>
-  <section class="panel"><div class="panel-head"><h2>队伍记录</h2><span id="boardInfo" class="muted"></span></div><div class="table-wrap"><table><thead><tr><th>最近排名</th><th>队伍</th><th>最近分数</th><th>观测最高分</th><th>最高分出现时间</th><th>最近出现时间</th><th>状态</th></tr></thead><tbody id="members"></tbody></table><div id="membersEmpty" class="empty">登录并启动采集后，这里会显示记录。</div></div></section>
+  <section class="panel"><div class="panel-head"><h2>队伍记录</h2><span id="boardInfo" class="muted"></span></div><div class="table-wrap"><table><thead><tr><th>最近排名</th><th>队伍</th><th id="organizationHead" class="hidden">组织</th><th>最近分数</th><th>观测最高分</th><th>最高分出现时间</th><th>最近出现时间</th><th>状态</th></tr></thead><tbody id="members"></tbody></table><div id="membersEmpty" class="empty">登录并启动采集后，这里会显示记录。</div></div></section>
   <section class="panel"><div class="panel-head"><h2>变化时间线</h2><label><input id="signals" type="checkbox" checked> 只看榜首变化、回退、未出现、重现、改名</label></div><div class="table-wrap"><table><thead><tr><th>采样时间</th><th>变化</th><th>队伍</th><th>详情</th><th>原始快照</th></tr></thead><tbody id="events"></tbody></table><div id="eventsEmpty" class="empty">还没有符合筛选条件的变化。</div></div><div class="footer"><span id="eventInfo" class="muted"></span><div><button id="live" class="hidden">回到最新</button> <button id="more">加载更早记录</button></div></div></section>
   <div class="note">“未出现”和分数回退只是排查线索，也可能来自榜单维护、成绩重算或队伍改名。无法观测从未公开的成绩，以及两次采样之间出现又消失的记录。整个榜单为空、接口报错、封榜时会保留上次有效记录。</div>
   <p class="muted"><small id="timezone"></small><small> · 此页面每 3 秒读取本地数据库，赛事接口默认每 10 秒采样一次。</small></p>
@@ -42,22 +42,24 @@ async function api(path){if(path!=='/api/rankings'&&$('ranking').value)path=scop
 function matches(name){return String(name).toLowerCase().includes($('search').value.trim().toLowerCase());}
 function render(){
   if(!summary)return;
-  const latest=summary.latest, good=summary.last_valid, state=summary.states.find(s=>s.scope===$('board').value);
+  const latest=summary.latest, good=summary.last_valid, state=summary.states.find(s=>s.scope===$('board').value), hasOrganization=summary.provider==='tianchi';
+  $('providerLabel').textContent='BEAUCLAW / '+(summary.provider_name||'GitCode');
+  $('organizationHead').classList.toggle('hidden',!hasOrganization);
   $('polls').textContent=summary.poll_count.toLocaleString();
   $('retention').textContent=`关键快照 ${summary.critical_poll_count??0} 份，永久保留 · 普通快照保留 ${summary.snapshot_limit??100} 份；仍在使用的比较基线受保护`;
   if(latest){const age=Math.max(0,Math.round((Date.now()-new Date(latest.captured_at))/1000));
     const labels={ok:'采样成功',error:'采样失败',sealed:'赛程已封榜',unavailable:'榜单暂不可用'};
     const stale=age>Math.max(30,summary.interval_seconds*3);
     $('health').innerHTML=`<span class="${latest.status==='ok'&&!stale?'good':'warn'}">● ${esc(labels[latest.status]||latest.status)}</span> · 最后采样 ${esc(date(latest.captured_at))}（${age}s 前）${stale?' · 暂无新样本，请检查采集进程':''} · ${esc(latest.error||latest.info.reason||'')}`;
-  }else $('health').textContent='尚无快照，请先登录并启动采集。';
+  }else $('health').textContent=summary.provider==='tianchi'?'尚无快照，请启动采集。':'尚无快照，请先登录并启动采集。';
   $('mailHealth').textContent=`邮件通知：${summary.notice_count} 个通知邮箱 · SMTP 已接受 ${summary.mail_sent} 封 · 待发送 ${summary.mail_pending} 封${summary.mail_last_error?' · 最近错误：'+summary.mail_last_error:''}`;
   const members=Object.values(state?.members||{}), below=m=>lowerThan(m.entry.score,m.peak_score);
   $('teams').textContent=members.length;$('below').textContent=members.filter(below).length;$('missing').textContent=members.filter(m=>!m.present).length;
   $('boardInfo').textContent=state?`${state.available?'最近有效数据':'整榜暂不可用，展示历史数据'}：${date(state.last_valid_at)}`:'';
   const visible=members.filter(m=>matches(m.entry.name)&&(!$('flagged').checked||!m.present||below(m))).sort((a,b)=>Number(b.present)-Number(a.present)||a.entry.rank-b.entry.rank);
-  $('members').innerHTML=visible.map(m=>`<tr><td class="number">${m.present?m.entry.rank:'—'}</td><td class="name" title="${esc(m.entry.name)}">${esc(m.entry.name)}</td><td class="number ${below(m)?'warn':''}">${esc(m.entry.score)}</td><td class="number good">${esc(m.peak_score)}</td><td>${esc(date(m.peak_at))}</td><td>${esc(date(m.last_seen))}</td><td class="${!m.present||below(m)?'warn':'muted'}">${!m.present?`未出现 · ${m.missing_count} 份有效快照`:below(m)?'低于观测最高分':'最近快照中在榜'}</td></tr>`).join('');
+  $('members').innerHTML=visible.map(m=>`<tr><td class="number">${m.present?(m.entry.display_rank??m.entry.rank):'—'}</td><td class="name" title="${esc(m.entry.name)}">${esc(m.entry.name)}</td>${hasOrganization?`<td class="name" title="${esc(m.entry.organization||'—')}">${esc(m.entry.organization||'—')}</td>`:''}<td class="number ${below(m)?'warn':''}">${esc(m.entry.score)}</td><td class="number good">${esc(m.peak_score)}</td><td>${esc(date(m.peak_at))}</td><td>${esc(date(m.last_seen))}</td><td class="${!m.present||below(m)?'warn':'muted'}">${!m.present?`未出现 · ${m.missing_count} 份有效快照`:below(m)?'低于观测最高分':'最近快照中在榜'}</td></tr>`).join('');
   $('membersEmpty').classList.toggle('hidden',visible.length>0);
-  $('membersEmpty').textContent=state?'没有符合筛选条件的队伍。':'登录并启动采集后，这里会显示记录。';
+  $('membersEmpty').textContent=state?'没有符合筛选条件的队伍。':hasOrganization?'启动采集后，这里会显示记录。':'登录并启动采集后，这里会显示记录。';
   renderEvents();
 }
 function eventDetail(e){const b=e.before,a=e.after,d=e.details;
@@ -86,9 +88,9 @@ async function refresh(){
     $('ranking').innerHTML=rankings.map(r=>`<option value="${esc(r.short_id)}">${esc(r.short_id+'-'+r.name)}</option>`).join('')||'<option value="">暂无监控比赛</option>';
     if(rankings.some(r=>r.short_id===chosen))$('ranking').value=chosen;
     const next=await api('/api/summary');if(version!==filterVersion)return;summary=next;
-    if(summary.competition_id)$('source').href=`https://competition.gitcode.com/competition/${summary.competition_id}/live-ranking`;
+    if(summary.source_url)$('source').href=summary.source_url;else $('source').removeAttribute('href');
     const selected=$('board').value, current=summary.latest?.info?.schedule_id||summary.last_valid?.info?.schedule_id;
-    const states=[...summary.states].sort((a,b)=>Number(b.schedule_id===current)-Number(a.schedule_id===current)||Number(b.board==='realtime_region_ranking')-Number(a.board==='realtime_region_ranking')||a.scope.localeCompare(b.scope));
+    const states=[...summary.states].sort((a,b)=>Number(b.schedule_id===current)-Number(a.schedule_id===current)||Number(b.board===summary.primary_board)-Number(a.board===summary.primary_board)||a.scope.localeCompare(b.scope));
     $('board').innerHTML=states.map(s=>`<option value="${esc(s.scope)}">${esc(s.schedule_name)} / ${esc(s.title)}${s.schedule_id===current?'':'（历史赛程）'}</option>`).join('')||'<option value="">等待榜单数据</option>';
     if(states.some(s=>s.scope===selected))$('board').value=selected;
     if(!historyPaused)await loadEvents(false);$('error').textContent='';render();

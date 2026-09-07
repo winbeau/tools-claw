@@ -41,7 +41,7 @@ main() {
     case "$(uname -s)" in Linux|Darwin) ;; *) die "Linux and macOS are currently supported." ;; esac
     command -v curl >/dev/null 2>&1 || die "Install curl first."
     command -v tar >/dev/null 2>&1 || die "Install tar first."
-    beau_version=${BEAUCLAW_VERSION:-0.3.1}
+    beau_version=${BEAUCLAW_VERSION:-0.4.0}
     case "$beau_version" in v*) beau_version=${beau_version#v} ;; esac
     case "$beau_version" in ''|*[!0-9.]*|.*|*.) die "Invalid version." ;; esac
     beau_release_base=${BEAUCLAW_RELEASE_BASE_URL:-https://github.com/winbeau/tools-claw/releases}
@@ -111,7 +111,7 @@ main() {
             printf 'Add %s to PATH, or use the absolute command path above.\n' "$beau_bin_dir"
         fi
     fi
-    printf '\nFirst use:\n  beauclaw ranking add https://competition.gitcode.com/competition/2094722369343447042/live-ranking\n  beauclaw config set\n  beauclaw notice add EMAIL\n  beauclaw login --browser\n  beauclaw test\n  beauclaw start\n\nManage: beauclaw ranking list / beauclaw notice list / beauclaw status / beauclaw stop\n'
+    printf '\nFirst use (add one or both leaderboards):\n  beauclaw ranking add https://competition.gitcode.com/competition/2094722369343447042/live-ranking\n  beauclaw ranking add https://tianchi.aliyun.com/competition/entrance/532499/rankingList\n  beauclaw config set\n  beauclaw notice add EMAIL\n  beauclaw login --browser  # GitCode only; public Tianchi rankings need no login\n  beauclaw test\n  beauclaw start\n\nManage: beauclaw ranking list / beauclaw notice list / beauclaw status / beauclaw stop\n'
     printf 'Upgrade: rerun the installer, then beauclaw stop && beauclaw start.\n'
 }
 

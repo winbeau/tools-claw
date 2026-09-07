@@ -1,4 +1,4 @@
-"""Fetch, validate, and persist public CANN leaderboard observations."""
+"""Persist leaderboard observations, with GitCode parsing and shared state logic."""
 from __future__ import annotations
 
 import hashlib
@@ -80,6 +80,10 @@ def fetch(event_id: str, auth: dict, timeout: float = 8) -> Response:
         headers["Authorization"] = token if token.startswith("Bearer ") else f"Bearer {token}"
     if auth.get("cookie"):
         headers["Cookie"] = auth["cookie"]
+    return fetch_url(url, headers, timeout)
+
+
+def fetch_url(url: str, headers: dict, timeout: float = 8) -> Response:
     started = utcnow()
     try:
         try:
@@ -251,7 +255,9 @@ def update_state(state: dict | None, members: dict, context: dict,
 
 
 class Store:
-    def __init__(self, path: Path, event_id: str | None = None, notice_db: Path | None = None):
+    def __init__(self, path: Path, event_id: str | None = None, notice_db: Path | None = None,
+                 provider: str | None = None):
+        from beauclaw.providers import get_provider
         self.path = Path(path)
         self.notice_db = Path(notice_db) if notice_db else self.path
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -284,8 +290,20 @@ class Store:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL);
         """)
+        saved_provider = self.db.execute("SELECT value FROM meta WHERE key='provider'").fetchone()
+        existing = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
+        bound_provider = saved_provider[0] if saved_provider else "gitcode" if existing else None
+        if (event_id and existing and existing[0] != event_id) or (provider and bound_provider and provider != bound_provider):
+            self.close()
+            raise ValueError("Database belongs to another competition or provider; use a different --db path")
+        self.source = get_provider(provider or bound_provider or "gitcode")
+        self.provider = self.source.id
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
+            if event_id:
+                self.db.execute("INSERT OR IGNORE INTO meta VALUES ('competition_id', ?)", (event_id,))
+            if provider or existing or event_id:
+                self.db.execute("INSERT OR IGNORE INTO meta VALUES ('provider', ?)", (self.provider,))
             if "short_id" not in {row[1] for row in self.db.execute("PRAGMA table_info(notices)")}:
                 self.db.execute("ALTER TABLE notices ADD COLUMN short_id TEXT")
             used = {row[0] for row in self.db.execute("SELECT short_id FROM notices WHERE short_id IS NOT NULL")}
@@ -304,7 +322,8 @@ class Store:
             if not self.db.execute("SELECT 1 FROM meta WHERE key='snapshot_retention_v1'").fetchone():
                 # Protect historical evidence before the first automatic cleanup, even
                 # if mail was disabled or there were no recipients at the time.
-                for row in self.db.execute("SELECT poll_id,details_json FROM events WHERE kind='leader_changed' AND scope LIKE '%:realtime_region_ranking'").fetchall():
+                for row in self.db.execute("SELECT poll_id,details_json FROM events WHERE kind='leader_changed' AND scope LIKE ?",
+                                           ("%:" + self.source.primary_board,)).fetchall():
                     self._mark_critical(row["poll_id"], "leader_changed")
                     self._mark_critical(json.loads(row["details_json"]).get("previous_poll_id"), "before_leader_change")
                 for row in self.db.execute("SELECT poll_id,payload_json FROM mail_outbox").fetchall():
@@ -312,13 +331,6 @@ class Store:
                     for event in json.loads(row["payload_json"]).get("events", []):
                         self._mark_critical(event.get("details", {}).get("previous_poll_id"), "before_leader_change")
                 self.db.execute("INSERT INTO meta VALUES ('snapshot_retention_v1','1')")
-        if event_id:
-            existing = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
-            if existing and existing[0] != event_id:
-                self.close()
-                raise ValueError("Database belongs to another competition; use a different --db path")
-            with self.db:
-                self.db.execute("INSERT OR IGNORE INTO meta VALUES ('competition_id', ?)", (event_id,))
 
     def close(self) -> None:
         self.db.close()
@@ -363,7 +375,11 @@ class Store:
                          response.status, f"API HTTP {response.status}")
         else:
             try:
-                info = parse_board(response.body, response.captured_at)
+                info = self.source.parse(response.body, response.captured_at)
+                bound_id = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
+                if info.get("competition_id") and bound_id and info["competition_id"] != bound_id[0]:
+                    raise InvalidBoard("Leaderboard response belongs to another competition; it was not compared")
+                info.setdefault("primary_board", self.source.primary_board)
                 status = info["status"]
             except InvalidBoard as exc:
                 status, error = "error", str(exc)
@@ -385,7 +401,7 @@ class Store:
                     state = json.loads(row[0]) if row else None
                     context = {"scope": scope, "schedule_id": info["schedule_id"],
                                "schedule_name": info["schedule_name"], "board": board_key,
-                               "title": BOARDS[board_key]}
+                               "title": self.source.boards[board_key]}
                     state, new_events = update_state(state, members, context, response.captured_at,
                                                      poll_id, missing_samples)
                     self.db.execute("INSERT OR REPLACE INTO states VALUES (?,?)", (scope, dumps(state)))
@@ -398,7 +414,7 @@ class Store:
                         events.append({**event, "scope": scope, "poll_id": poll_id})
             critical = False
             for event in events:
-                if event["kind"] == "leader_changed" and event["scope"].endswith(":realtime_region_ranking"):
+                if event["kind"] == "leader_changed" and event["scope"].endswith(":" + self.source.primary_board):
                     critical = True
                     self._mark_critical(poll_id, "leader_changed")
                     self._mark_critical(event["details"].get("previous_poll_id"), "before_leader_change")
@@ -409,12 +425,13 @@ class Store:
                 if leaders:
                     event_id = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()[0]
                     for notice in self.notices():
-                        message = {"competition_id": event_id, "captured_at": response.captured_at,
+                        message = {"competition_id": event_id, "provider": self.provider,
+                                   "source_url": self.source.url(event_id), "captured_at": response.captured_at,
                                    "poll_id": poll_id, "events": leaders, "critical": True, "sender": mail_policy["sender"],
                                    "recipient": notice["email"], "recipient_id": notice["id"],
                                    "recipient_created_at": notice["created_at"],
                                    "schedule_name": info["schedule_name"],
-                                   "competition_name": mail_policy.get("competition_name", "CANN 挑战赛"),
+                                   "competition_name": mail_policy.get("competition_name") or info.get("competition_name") or "CANN 挑战赛",
                                    "ranking_id": mail_policy.get("ranking_id"),
                                    "ranking_generation": mail_policy.get("ranking_generation"),
                                    "top10": top_ten(info)}
@@ -441,7 +458,9 @@ class Store:
             states = [json.loads(row[0]) for row in self.db.execute("SELECT state_json FROM states")]
             event_id = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
             interval = self.db.execute("SELECT value FROM meta WHERE key='interval_seconds'").fetchone()
-            return {"competition_id": event_id[0] if event_id else None, "latest": latest,
+            return {"competition_id": event_id[0] if event_id else None, "provider": self.provider,
+                    "provider_name": self.source.name, "primary_board": self.source.primary_board,
+                    "source_url": self.source.url(event_id[0]) if event_id else None, "latest": latest,
                     "last_valid": good, "states": states, "kinds": KINDS,
                     "interval_seconds": float(interval[0]) if interval else 10,
                     "mail_pending": self.db.execute("SELECT count(*) FROM mail_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL").fetchone()[0],
@@ -530,18 +549,18 @@ class Store:
         if not snapshot:
             return {}
         try:
-            board = parse_board(snapshot["raw_body"].encode(), snapshot["captured_at"])
+            board = self.source.parse(snapshot["raw_body"].encode(), snapshot["captured_at"])
         except InvalidBoard:
             return {}
         event_id = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
-        return {"poll_id": poll_id, "captured_at": snapshot["captured_at"],
+        return {"poll_id": poll_id, "provider": self.provider, "captured_at": snapshot["captured_at"],
                 "competition_id": event_id[0] if event_id else DEFAULT_COMPETITION,
                 "schedule_name": board.get("schedule_name", ""), "top10": top_ten(board)}
 
 
 def top_ten(board: dict) -> list[dict]:
-    members = board.get("boards", {}).get("realtime_region_ranking", {})
-    return [{key: member[key] for key in ("rank", "name", "score")}
+    members = board.get("boards", {}).get(board.get("primary_board", "realtime_region_ranking"), {})
+    return [{key: member[key] for key in ("rank", "name", "score", "organization", "display_score", "display_rank") if key in member}
             for member in sorted(members.values(), key=lambda row: row["rank"])[:10]]
 
 

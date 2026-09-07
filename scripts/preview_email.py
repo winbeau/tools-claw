@@ -22,3 +22,17 @@ for kind in ('notification', 'test'):
     (output / f'{kind}.html').write_text(message.get_body(preferencelist=('html',)).get_content())
     (output / f'{kind}.eml').write_bytes(message.as_bytes())
 print(f'Fictional email previews: {output}')
+
+tianchi_rows = [{**row, 'score': f'{5-i/10:.12f}', 'display_score': f'{5-i/10:.2f}',
+                'organization': ['示例大学', '示例研究院', '示例实验室', ''][i % 4]}
+               for i, row in enumerate(rows)]
+tianchi_payload = {**payload, 'provider': 'tianchi', 'competition_id': '532499',
+                   'competition_name': '示例赛事 · 生成式图像增强可控性挑战',
+                   'top10': tianchi_rows,
+                   'events': [{'scope': '1823:leaderboard',
+                               'before': {**tianchi_rows[1], 'score':'4.900000000000','display_score':'4.90'},
+                               'after': tianchi_rows[0], 'details': {'previous_poll_id':127}}]}
+for kind in ('notification', 'test'):
+    message = create_message({**tianchi_payload, 'test': kind == 'test'}, f'<preview-tianchi-{kind}@example.com>')
+    (output / f'tianchi-{kind}.html').write_text(message.get_body(preferencelist=('html',)).get_content())
+    (output / f'tianchi-{kind}.eml').write_bytes(message.as_bytes())

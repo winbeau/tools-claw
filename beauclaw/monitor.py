@@ -12,6 +12,7 @@ from beauclaw.auth import load_auth
 from beauclaw.core import Response, Store, fetch, utcnow
 from beauclaw.mail import MailWorker, load_mail_config, mail_policy
 from beauclaw.rankings import Rankings, is_active
+from beauclaw.providers import get_provider
 from beauclaw.service import mark_worker
 
 
@@ -35,7 +36,8 @@ class Collector(threading.Thread):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ValueError("Another collector already owns this ranking database") from None
-            store = Store(path, self.ranking["competition_id"], notice_db=self.args.db)
+            source = get_provider(self.ranking.get("provider", "gitcode"))
+            store = Store(path, self.ranking["competition_id"], notice_db=self.args.db, provider=source.id)
             with store.db:
                 store.db.execute("INSERT OR REPLACE INTO meta VALUES ('interval_seconds',?)", (str(self.args.interval),))
             active = lambda: not self.stop_event.is_set() and is_active(self.args.db, self.ranking["short_id"], self.ranking["generation"])
@@ -47,15 +49,18 @@ class Collector(threading.Thread):
             while active():
                 started = time.monotonic()
                 try:
-                    auth = load_auth(self.args.auth_file, self.args.token_file)
-                    response = fetch(self.ranking["competition_id"], auth, self.args.timeout)
+                    auth = load_auth(self.args.auth_file, self.args.token_file) if source.requires_login else {}
+                    fetcher = fetch if source.id == "gitcode" else source.fetch
+                    response = fetcher(self.ranking["competition_id"], auth, self.args.timeout)
                 except (OSError, ValueError) as exc:
+                    message = (f"Could not read local credentials ({type(exc).__name__}); run beauclaw login"
+                               if source.requires_login else f"Public leaderboard request failed ({type(exc).__name__}); retrying")
                     response = Response(utcnow(), utcnow(), "", None,
-                                        error=f"Could not read local credentials ({type(exc).__name__}); run beauclaw login")
+                                        error=message)
                 policy = None
                 if active() and not self.args.no_mail and self.args.mail_config.exists():
                     try:
-                        policy = {**mail_policy(load_mail_config(self.args.mail_config)),
+                        policy = {**mail_policy(load_mail_config(self.args.mail_config), provider=source.id),
                                   "competition_name": self.ranking["name"],
                                   "ranking_id": self.ranking["short_id"],
                                   "ranking_generation": self.ranking["generation"]}

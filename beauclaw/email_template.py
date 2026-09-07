@@ -10,6 +10,9 @@ from beauclaw.core import DEFAULT_COMPETITION, utcnow
 
 
 def render_email(payload: dict) -> tuple[str, str, str]:
+    if payload.get("provider") == "tianchi":
+        from beauclaw.email_tianchi import render_tianchi_email
+        return render_tianchi_email(payload)
     test = bool(payload.get("test"))
     preview = bool(payload.get("preview"))
     title = "前十名榜单" if test else "榜一变动"
