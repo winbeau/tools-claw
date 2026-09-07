@@ -38,9 +38,20 @@ def dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def name_changed(before: dict, after: dict) -> bool:
+    return (before["name"] != after["name"]
+            and before.get("name_source") != "unavailable"
+            and after.get("name_source") != "unavailable")
+
+
+def display_name(entry: dict) -> str:
+    name = str(entry["name"])
+    return name + "（上次公开队名）" if entry.get("name_source") == "history" else name
+
+
 def should_notify_leader(event: dict) -> bool:
     before, after = event["before"], event["after"]
-    return (before.get("key") != after.get("key") or before["name"] != after["name"]
+    return (before.get("key") != after.get("key") or name_changed(before, after)
             or Decimal(after["score"]) > Decimal(before["score"]))
 
 
@@ -195,6 +206,11 @@ def update_state(state: dict | None, members: dict, context: dict,
     baseline = state is None or not state["members"]
     if state is None:
         state = {**context, "members": {}, "available": True}
+    for key, entry in members.items():
+        # Missing public profile data does not change a stable team identity.
+        previous = state["members"].get(key, {}).get("entry")
+        if entry.get("name_source") == "unavailable" and previous and previous.get("name_source") != "unavailable":
+            entry.update(name=previous["name"], name_source="history")
 
     def emit(kind: str, key: str = "", before: dict | None = None,
              after: dict | None = None, **details: Any) -> None:
@@ -218,7 +234,8 @@ def update_state(state: dict | None, members: dict, context: dict,
         previous_leader = next((m["entry"] for m in state["members"].values()
                                 if m["present"] and m["entry"]["rank"] == 1), None)
         current_leader = next(m for m in members.values() if m["rank"] == 1)
-        if previous_leader and any(previous_leader[k] != current_leader[k] for k in ("key", "name", "score")):
+        if previous_leader and (any(previous_leader[k] != current_leader[k] for k in ("key", "score"))
+                                or name_changed(previous_leader, current_leader)):
             emit("leader_changed", current_leader["key"], previous_leader, current_leader,
                  previous_poll_id=state.get("last_valid_poll_id"))
     for key, entry in members.items():
@@ -233,7 +250,7 @@ def update_state(state: dict | None, members: dict, context: dict,
             previous = old["entry"]
             if not old["present"]:
                 emit("returned", key, previous, entry, missing_since=old["missing_since"])
-            if previous["name"] != entry["name"]:
+            if name_changed(previous, entry):
                 emit("renamed", key, previous, entry)
             current_score, previous_score = Decimal(entry["score"]), Decimal(previous["score"])
             if current_score != previous_score:
@@ -569,7 +586,7 @@ class Store:
 
 def top_ten(board: dict) -> list[dict]:
     members = board.get("boards", {}).get(board.get("primary_board", "realtime_region_ranking"), {})
-    return [{key: member[key] for key in ("rank", "name", "score", "organization", "display_score", "display_rank") if key in member}
+    return [{key: member[key] for key in ("rank", "name", "name_source", "score", "organization", "display_score", "display_rank") if key in member}
             for member in sorted(members.values(), key=lambda row: row["rank"])[:10]]
 
 

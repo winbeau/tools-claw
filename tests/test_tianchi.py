@@ -147,6 +147,9 @@ class TianchiTests(unittest.TestCase):
             incomplete=fixture();page=json.loads(incomplete['pages'][1]['body']);page['data']['total']+=1;incomplete['pages'][1]['body']=dumps(page);broken.append(incomplete)
             changed=fixture();page=json.loads(changed['confirmation']['body']);page['data']['list'][0]['score']='200';changed['confirmation']['body']=dumps(page);broken.append(changed)
             bad_score=fixture(teams(1));page=json.loads(bad_score['pages'][0]['body']);page['data']['list'][0]['score']='NaN';bad_score['pages'][0]['body']=dumps(page);broken.append(bad_score)
+            for field in ('teamId','score'):
+                bad_rows=teams(1);bad_rows[0].pop(field);broken.append(fixture(bad_rows))
+            bad_name=teams(1);bad_name[0]['teamName']={'unexpected':'object'};broken.append(fixture(bad_name))
             for value in broken:
                 poll,events=history.record(captured(value))
                 self.assertEqual(poll['status'],'error')
@@ -157,6 +160,80 @@ class TianchiTests(unittest.TestCase):
                 self.assertEqual(poll['status'],'unavailable')
                 self.assertEqual(events,[])
                 self.assertEqual(history.summary()['states'],original)
+
+    def test_missing_profiles_preserve_identity_and_history_across_restart(self):
+        with Rankings(self.db) as registry:
+            row=registry.add(URL,name='Tianchi fixture')
+        path=Path(row['db'])
+        policy=mail_policy(load_mail_config(self.config),provider='tianchi')
+        rows=teams(12)
+        with contextlib.closing(Store(path,'532499',notice_db=self.db,provider='tianchi')) as history:
+            history.record(captured(fixture(rows)),mail_policy=policy)
+            for position in (0,7):
+                rows[position].pop('teamName')
+                rows[position].pop('teamLeaderOrganization')
+            sample=captured(fixture(rows))
+            poll,events=history.record(sample,mail_policy=policy)
+            self.assertEqual(poll['status'],'ok')
+            self.assertEqual(poll['info']['counts']['leaderboard'],12)
+            self.assertEqual(events,[])
+            self.assertFalse(poll['critical'])
+            self.assertEqual(history.summary()['mail_pending'],0)
+            self.assertEqual(history.snapshot(poll['id'])['raw_body'],sample.body.decode())
+            entry=history.summary()['states'][0]['members']['team_id:1007']['entry']
+            self.assertEqual((entry['name'],entry['name_source']),('示例队伍8','history'))
+        with contextlib.closing(Store(path,'532499',notice_db=self.db,provider='tianchi')) as history:
+            poll,events=history.record(captured(fixture(rows)),mail_policy=policy)
+            self.assertEqual(events,[])
+            rows[0]['score']='99.999'
+            dropped,_=history.record(captured(fixture(rows)),mail_policy=policy)
+            self.assertTrue(dropped['critical'])
+            self.assertEqual(history.summary()['mail_pending'],0)
+            rows[0]['score']='100.001'
+            raised,_=history.record(captured(fixture(rows)),mail_policy=policy)
+            self.assertTrue(raised['critical'])
+            self.assertEqual(history.summary()['mail_pending'],1)
+            payload=json.loads(history.db.execute('SELECT payload_json FROM mail_outbox').fetchone()[0])
+            self.assertEqual(payload['top10'][0]['name_source'],'history')
+            message=create_message(payload,'<missing-profile@example.com>')
+            for part in ('html','plain'):
+                self.assertIn('示例队伍1（上次公开队名）',message.get_body(preferencelist=(part,)).get_content())
+            rows[0]['teamName']='示例队伍1'
+            _,events=history.record(captured(fixture(rows)),mail_policy=policy)
+            self.assertNotIn('leader_changed',[event['kind'] for event in events])
+            self.assertEqual(history.summary()['mail_pending'],1)
+            rows[0].pop('teamName')
+            history.record(captured(fixture(rows)),mail_policy=policy)
+            rows[0]['teamName']='实际改名后的队伍'
+            renamed,events=history.record(captured(fixture(rows)),mail_policy=policy)
+            self.assertTrue(renamed['critical'])
+            self.assertIn('renamed',[event['kind'] for event in events])
+            self.assertEqual(history.summary()['mail_pending'],2)
+
+    def test_first_public_name_is_not_a_rename_but_anonymous_leader_replacement_notifies(self):
+        with Rankings(self.db) as registry:
+            row=registry.add(URL,name='Tianchi fixture')
+        policy=mail_policy(load_mail_config(self.config),provider='tianchi')
+        with contextlib.closing(Store(Path(row['db']),'532499',notice_db=self.db,provider='tianchi')) as history:
+            rows=teams(12);rows[0]['teamName']=None
+            poll,_=history.record(captured(fixture(rows)),mail_policy=policy)
+            entry=history.summary()['states'][0]['members']['team_id:1000']['entry']
+            self.assertEqual(entry['name_source'],'unavailable')
+            self.assertIn('ID 1000',entry['name'])
+            rows[0]['teamName']='首次公开的队名'
+            poll,events=history.record(captured(fixture(rows)),mail_policy=policy)
+            self.assertEqual(events,[])
+            self.assertFalse(poll['critical'])
+            self.assertEqual(history.summary()['mail_pending'],0)
+            rows[0].update(teamId=2000,teamName=' ',score='99.999')
+            poll,_=history.record(captured(fixture(rows)),mail_policy=policy)
+            self.assertTrue(poll['critical'])
+            self.assertEqual(history.summary()['mail_pending'],1)
+            rows[0]['teamName']='新榜首首次公开队名'
+            poll,events=history.record(captured(fixture(rows)),mail_policy=policy)
+            self.assertNotIn('leader_changed',[event['kind'] for event in events])
+            self.assertFalse(poll['critical'])
+            self.assertEqual(history.summary()['mail_pending'],1)
 
     def test_fetch_all_pages_without_credentials_and_preserve_rate_limit(self):
         value=fixture()

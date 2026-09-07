@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from html import escape
 
-from beauclaw.core import format_score, utcnow
+from beauclaw.core import display_name, format_score, utcnow
 from beauclaw.providers import get_provider
 
 
@@ -32,27 +32,27 @@ def render_tianchi_email(payload: dict) -> tuple[str, str, str]:
         for event in payload["events"]:
             before, after = event["before"], event["after"]
             old_score, new_score = shown_score(before), shown_score(after)
-            plain.extend([f"变化前：{before['name']} | {organization(before)} | 分数 {old_score}",
-                          f"变化后：{after['name']} | {organization(after)} | 分数 {new_score}",
+            plain.extend([f"变化前：{display_name(before)} | {organization(before)} | 分数 {old_score}",
+                          f"变化后：{display_name(after)} | {organization(after)} | 分数 {new_score}",
                           f"变动前快照：#{event['details'].get('previous_poll_id')}", ""])
             changes.append(f'''<tr><td style="padding:26px 24px">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed"><tr>
 <td width="44%" valign="top" style="padding:18px 14px;background:#f7f8fa;border:1px solid #e9ebf0;border-radius:8px;overflow-wrap:anywhere;word-wrap:break-word;word-break:break-word">
 <div style="font-size:12px;color:#777e90;margin-bottom:10px">变化前</div>
-<div style="font-size:16px;font-weight:700;color:#353b4a">{escape(str(before['name']))}</div>
+<div style="font-size:16px;font-weight:700;color:#353b4a">{escape(display_name(before))}</div>
 <div style="font-size:12px;color:#81889a;line-height:1.6;margin-top:5px">{escape(organization(before))}</div>
 <div style="font-size:26px;font-weight:700;color:#61697c;line-height:1.35;margin-top:14px">{escape(old_score)}</div><div style="font-size:11px;color:#8d94a4">分数</div></td>
 <td width="12%" align="center" style="font-size:24px;color:#6472fc">→</td>
 <td width="44%" valign="top" style="padding:18px 14px;background:#f1f3ff;border:1px solid #dce1ff;border-radius:8px;overflow-wrap:anywhere;word-wrap:break-word;word-break:break-word">
 <div style="font-size:12px;color:#5062df;margin-bottom:10px">当前榜首</div>
-<div style="font-size:16px;font-weight:700;color:#202743">{escape(str(after['name']))}</div>
+<div style="font-size:16px;font-weight:700;color:#202743">{escape(display_name(after))}</div>
 <div style="font-size:12px;color:#7580a8;line-height:1.6;margin-top:5px">{escape(organization(after))}</div>
 <div style="font-size:26px;font-weight:700;color:#525af4;line-height:1.35;margin-top:14px">{escape(new_score)}</div><div style="font-size:11px;color:#7b83a4">分数</div></td>
 </tr></table></td></tr>''')
     plain.extend(["────────────────────", "榜单前十名", "排名 | 团队名称 | 组织 | 分数"])
     table_rows = []
     for row in rows:
-        rank, name, org, score = row.get("display_rank", row["rank"]), str(row["name"]), organization(row), shown_score(row)
+        rank, name, org, score = row.get("display_rank", row["rank"]), display_name(row), organization(row), shown_score(row)
         plain.append(f"{rank} | {name} | {org} | {score}")
         badge_bg, badge_ink = {1: ("#ebe5ff", "#7251dd"), 2: ("#e5edff", "#426dde"), 3: ("#ddf3fa", "#2589a8")}.get(rank, ("transparent", "#777f92"))
         table_rows.append(f'''<tr style="background:{'#f5f6ff' if rank == 1 else '#ffffff'}">

@@ -29,6 +29,7 @@ function renderTheme(){const dark=document.documentElement.dataset.theme==='dark
 $('theme').addEventListener('click',()=>{const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=theme;try{localStorage.setItem('beauclaw-theme',theme);}catch{}renderTheme();});renderTheme();
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const date=value=>value?new Date(value).toLocaleString('zh-CN',{hour12:false}):'—';
+const displayName=entry=>entry.name+(entry.name_source==='history'?'（上次公开队名）':'');
 function formatScore(value){ // Round decimal strings directly, matching email ROUND_HALF_UP.
   const match=/^(-?)(\d+)(?:\.(\d*))?$/.exec(String(value));if(!match)return '—';
   const fraction=(match[3]||'').padEnd(4,'0');
@@ -65,13 +66,13 @@ function render(){
   $('teams').textContent=members.length;$('below').textContent=members.filter(below).length;$('missing').textContent=members.filter(m=>!m.present).length;
   $('boardInfo').textContent=state?`${state.available?'最近有效数据':'整榜暂不可用，展示历史数据'}：${date(state.last_valid_at)}`:'';
   const visible=members.filter(m=>matches(m.entry.name)&&(!$('flagged').checked||!m.present||below(m))).sort((a,b)=>Number(b.present)-Number(a.present)||a.entry.rank-b.entry.rank);
-  $('members').innerHTML=visible.map(m=>`<tr><td class="number">${m.present?(m.entry.display_rank??m.entry.rank):'—'}</td><td class="name" title="${esc(m.entry.name)}">${esc(m.entry.name)}</td>${hasOrganization?`<td class="name" title="${esc(m.entry.organization||'—')}">${esc(m.entry.organization||'—')}</td>`:''}<td class="number ${below(m)?'warn':''}">${esc(formatScore(m.entry.score))}</td><td class="number good">${esc(formatScore(m.peak_score))}</td><td>${esc(date(m.peak_at))}</td><td>${esc(date(m.last_seen))}</td><td class="${!m.present||below(m)?'warn':'muted'}">${!m.present?`未出现 · ${m.missing_count} 份有效快照`:below(m)?'低于观测最高分':'最近快照中在榜'}</td></tr>`).join('');
+  $('members').innerHTML=visible.map(m=>`<tr><td class="number">${m.present?(m.entry.display_rank??m.entry.rank):'—'}</td><td class="name" title="${esc(displayName(m.entry))}">${esc(displayName(m.entry))}</td>${hasOrganization?`<td class="name" title="${esc(m.entry.organization||'—')}">${esc(m.entry.organization||'—')}</td>`:''}<td class="number ${below(m)?'warn':''}">${esc(formatScore(m.entry.score))}</td><td class="number good">${esc(formatScore(m.peak_score))}</td><td>${esc(date(m.peak_at))}</td><td>${esc(date(m.last_seen))}</td><td class="${!m.present||below(m)?'warn':'muted'}">${!m.present?`未出现 · ${m.missing_count} 份有效快照`:below(m)?'低于观测最高分':'最近快照中在榜'}</td></tr>`).join('');
   $('membersEmpty').classList.toggle('hidden',visible.length>0);
   $('membersEmpty').textContent=state?'没有符合筛选条件的队伍。':hasOrganization?'启动采集后，这里会显示记录。':'登录并启动采集后，这里会显示记录。';
   renderEvents();
 }
 function eventDetail(e){const b=e.before,a=e.after,d=e.details;
-  if(e.kind==='leader_changed')return `${b.name}（${formatScore(b.score)}）→ ${a.name}（${formatScore(a.score)}）`;
+  if(e.kind==='leader_changed')return `${displayName(b)}（${formatScore(b.score)}）→ ${displayName(a)}（${formatScore(a.score)}）`;
   if(e.kind==='score_up'||e.kind==='score_drop')return `${formatScore(b.score)} → ${formatScore(a.score)}`;
   if(e.kind==='rank_changed')return `第 ${b.rank} 名 → 第 ${a.rank} 名`;
   if(e.kind==='renamed')return `${b.name} → ${a.name}`;

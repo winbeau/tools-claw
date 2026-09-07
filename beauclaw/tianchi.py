@@ -175,21 +175,30 @@ def parse_board(body: bytes, observed_at: str) -> dict:
             if not isinstance(rows, list) or len(rows) != expected:
                 raise InvalidBoard("Tianchi leaderboard page is incomplete")
             for row in rows:
+                if not isinstance(row, dict):
+                    raise InvalidBoard(f"Tianchi page {page_number} contains an invalid team row")
                 if str(row.get("raceId")) != bundle["competition_id"] or str(row.get("seasonId")) != result["schedule_id"]:
                     raise InvalidBoard("Tianchi page mixes different competitions or seasons")
-                key = f"team_id:{row['teamId']}"
-                name = row["teamName"]
+                team_id = row.get("teamId")
+                if not str(team_id).isdigit():
+                    raise InvalidBoard(f"Tianchi page {page_number} is missing a valid teamId")
+                key = f"team_id:{team_id}"
+                name = row.get("teamName")
+                if name is not None and not isinstance(name, str):
+                    raise InvalidBoard(f"Tianchi page {page_number} contains an invalid teamName")
+                name = name.strip() if name else ""
                 position = len(members) + 1
-                if row.get("teamId") is None or not isinstance(name, str) or not name.strip() or key in members:
+                if key in members:
                     raise InvalidBoard("Tianchi row has an invalid or duplicate team identity")
                 if type(row.get("rank")) is not int or not previous_rank <= row["rank"] <= position:
                     raise InvalidBoard("Tianchi ranking order changed or is incomplete; retrying a complete snapshot")
                 previous_rank = row["rank"]
-                score = score_text(row["score"])
+                score = score_text(row.get("score"))
                 organization = row.get("teamLeaderOrganization") or ""
                 if not isinstance(organization, str):
                     raise InvalidBoard("Tianchi row has an invalid organization")
-                members[key] = {"key": key, "name": name.strip(), "rank": position, "score": score,
+                members[key] = {"key": key, "name": name or f"未公开队名（ID {team_id}）",
+                                "name_source": "api" if name else "unavailable", "rank": position, "score": score,
                                 "display_rank": row["rank"],
                                 "display_score": display_score(score, config.get("leaderboardFormat")),
                                 "organization": organization.strip(), "identity_basis": "team_id"}
