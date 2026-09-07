@@ -97,7 +97,10 @@ class RankingTests(unittest.TestCase):
             self.assertIn('&lt;script&gt;', html)
             self.assertNotIn('<script>', html)
             self.assertNotIn('后来的榜首', html)
-            self.assertIn('101.000000000000000001', html)
+            self.assertEqual(queued['top10'][0]['score'], '101.000000000000000001')
+            self.assertIn('>101.000</td>', html)
+            self.assertNotIn('101.000000000000000001', html)
+            self.assertIn('分数 101.000\n', message.get_body(preferencelist=('plain',)).get_content())
             recipient = self.store.notices()[0]
             self.store.delete_notice(recipient['short_id'])
             with Rankings(self.db) as registry:

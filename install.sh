@@ -41,7 +41,7 @@ main() {
     case "$(uname -s)" in Linux|Darwin) ;; *) die "Linux and macOS are currently supported." ;; esac
     command -v curl >/dev/null 2>&1 || die "Install curl first."
     command -v tar >/dev/null 2>&1 || die "Install tar first."
-    beau_version=${BEAUCLAW_VERSION:-0.4.0}
+    beau_version=${BEAUCLAW_VERSION:-0.4.1}
     case "$beau_version" in v*) beau_version=${beau_version#v} ;; esac
     case "$beau_version" in ''|*[!0-9.]*|.*|*.) die "Invalid version." ;; esac
     beau_release_base=${BEAUCLAW_RELEASE_BASE_URL:-https://github.com/winbeau/tools-claw/releases}

@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from html import escape
 
-from beauclaw.core import utcnow
+from beauclaw.core import format_score, utcnow
 from beauclaw.providers import get_provider
 
 
@@ -23,7 +23,7 @@ def render_tianchi_email(payload: dict) -> tuple[str, str, str]:
     changes = []
 
     def shown_score(entry: dict) -> str:
-        return str(entry.get("display_score") or entry["score"])
+        return format_score(entry["score"])
 
     def organization(entry: dict) -> str:
         return str(entry.get("organization") or "—")
@@ -32,13 +32,8 @@ def render_tianchi_email(payload: dict) -> tuple[str, str, str]:
         for event in payload["events"]:
             before, after = event["before"], event["after"]
             old_score, new_score = shown_score(before), shown_score(after)
-            # If rounding hides an actual increase, show the original score in the
-            # change card. The top-ten table keeps the website's displayed precision.
-            if old_score == new_score and before["score"] != after["score"]:
-                old_score, new_score = str(before["score"]), str(after["score"])
             plain.extend([f"变化前：{before['name']} | {organization(before)} | 分数 {old_score}",
                           f"变化后：{after['name']} | {organization(after)} | 分数 {new_score}",
-                          f"原始分数：{before['score']} → {after['score']}",
                           f"变动前快照：#{event['details'].get('previous_poll_id')}", ""])
             changes.append(f'''<tr><td style="padding:26px 24px">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="table-layout:fixed"><tr>
@@ -64,7 +59,7 @@ def render_tianchi_email(payload: dict) -> tuple[str, str, str]:
 <td align="center" style="padding:13px 6px;border-bottom:1px solid #eff0f4"><span style="display:inline-block;min-width:24px;line-height:26px;border-radius:6px;font-size:12px;font-weight:700;background:{badge_bg};color:{badge_ink}">{rank}</span></td>
 <td class="team-name" style="padding:13px 8px;border-bottom:1px solid #eff0f4;font-size:13px;line-height:1.7;color:#343947;white-space:normal;word-wrap:break-word;overflow-wrap:anywhere;word-break:normal">{escape(name)}</td>
 <td class="organization" style="padding:13px 8px;border-bottom:1px solid #eff0f4;font-size:12px;line-height:1.7;color:#747c8e;white-space:normal;word-wrap:break-word;overflow-wrap:anywhere;word-break:normal">{escape(org)}</td>
-<td align="right" title="{escape(str(row['score']), quote=True)}" style="padding:13px 10px 13px 6px;border-bottom:1px solid #eff0f4;font-size:14px;line-height:1.7;font-weight:700;color:{'#555df1' if rank == 1 else '#444e66'};font-variant-numeric:tabular-nums;overflow-wrap:anywhere;word-break:break-word">{escape(score)}</td></tr>''')
+<td align="right" style="padding:13px 10px 13px 6px;border-bottom:1px solid #eff0f4;font-size:14px;line-height:1.7;font-weight:700;color:{'#555df1' if rank == 1 else '#444e66'};font-variant-numeric:tabular-nums;overflow-wrap:anywhere;word-break:break-word">{escape(score)}</td></tr>''')
     if not rows:
         plain.append("暂无可展示的榜单快照。")
         table_rows.append('<tr><td colspan="4" style="padding:24px;color:#80889b">暂无可展示的榜单快照。</td></tr>')

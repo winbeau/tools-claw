@@ -8,7 +8,7 @@ import uuid
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -122,6 +122,15 @@ def score_text(value: Any) -> str:
         return "0" if number == 0 else text
     except (InvalidOperation, ValueError):
         raise InvalidBoard("Leaderboard contains an unparseable score") from None
+
+
+def format_score(value: Any) -> str:
+    """Round only the displayed score; stored scores keep their original precision."""
+    score = score_text(value)
+    with localcontext() as context:
+        context.prec = max(28, len(score) + 4)
+        rounded = Decimal(score).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+    return "0.000" if rounded == 0 else format(rounded, "f")
 
 
 def parse_board(body: bytes, observed_at: str) -> dict:
