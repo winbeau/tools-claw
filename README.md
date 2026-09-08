@@ -103,7 +103,7 @@ beauclaw stop
 
 `start` 使用专用 tmux socket 与会话，终端退出或 SSH 断开后继续运行。重复启动不会生成第二个进程。空榜单列表时后台保持等待，添加后自动开始采样。
 
-`status` 显示进程、各赛事的最近采样状态和邮件队列。进程运行不代表登录凭据有效，请关注采样错误。`stop` 正常停止并保留历史与队列，不影响其他 tmux 会话；默认等待 30 秒，必要时可 `stop --force`。不包含开机自启。
+`status` 显示进程、各赛事的最近采样状态、失败原因、连续失败次数、下次重试时间和邮件队列。进程运行不代表登录凭据有效，请关注每个榜单的采样状态。`stop` 正常停止并保留历史与队列，不影响其他 tmux 会话；默认等待 30 秒，必要时可 `stop --force`。不包含开机自启。
 
 ```bash
 beauclaw watch          # 前台监控所有已添加赛事
@@ -114,6 +114,25 @@ beauclaw --no-animation start
 支持 `--interval 10`、`--timeout 8`、`--missing-samples 2`、`--no-web`、`--no-mail`、`--port 8766` 和 `--db PATH`。`--competition ID` 保留单 GitCode 赛事采集模式；多平台监控请通过 `ranking add URL` 管理，并直接 `start`。自定义 `--db` 时，各管理命令也要使用同一个注册数据库路径。
 
 动画仅在交互终端启用，重定向日志和 JSON 输出保持纯文本。`BEAUCLAW_NO_ANIMATION=1` 可全局关闭动效；`NO_COLOR` 关闭颜色。
+
+## 采集诊断与日志
+
+```bash
+beauclaw logs                         # 最近 50 条记录
+beauclaw logs -f                      # 持续跟随，日志轮转后继续读取
+beauclaw logs --errors                # 独立保存的警告与错误记录
+beauclaw logs --ranking d2e527 -n 100  # 指定榜单，先筛选再取最近记录
+beauclaw logs --level ERROR --json    # 按最低级别筛选，输出 JSON Lines
+beauclaw start --log-level DEBUG      # 额外记录成功请求的详细诊断
+```
+
+前台 `watch` 和后台 `start` 均记录结构化日志，包含 UTC 时间、版本、进程/线程、榜单短名、快照编号、HTTP 状态、耗时、连续失败次数与下次重试时间。失败记录额外包含接口业务码、请求 ID、天池请求阶段和页码，以及异常类型、调用位置和缺失字段；快照 JSON 的 `diagnostics` 也保留对应信息。SMTP 日志使用通知邮箱短名，不写邮箱地址或服务端认证文本。
+
+主日志 `beauclaw.log` 和独立错误日志 `beauclaw.errors.log` 各自达到 **5 MiB** 时轮转，各保留 **5 个归档**（`.1` 最新，`.5` 最旧）；文件权限为 `0600`。普通成功采样不会挤掉独立错误日志。`logs` 同时检索当前和归档文件，兼容旧版纯文本日志。日志过滤 Token、Cookie、SMTP 密码、邮箱地址，不转储响应正文、请求认证头或异常局部变量；原始公开榜单证据仍通过快照查看。启动阶段的输出另存 `beauclaw.console.log`，启动失败时可同时检查它。自定义数据库路径时使用 `logs --db PATH`。
+
+错误类型区分登录过期、限流、HTTP 错误、网络超时/DNS/TLS、分页期间变化和数据校验失败。**HTTP 401 通常是 GitCode 网页会话失效，并不表示查询过载**；运行 `beauclaw login --browser`，采集器在约 1 秒内检测凭据文件更新并重试。显式 `--token-file` 优先于环境变量和保存的登录会话；若使用 `BEAUCLAW_TOKEN`，需更新或取消该环境变量后重启，重新网页登录不会覆盖运行进程的环境变量。
+
+HTTP 429 按服务端 `Retry-After` 和指数退避等待；天池分页期间榜单变化会丢弃不一致的数据并重新采集。状态页面显示失败分类和重试倒计时，计划退避期间不会误报采集进程没有响应。失败恢复后记录 `collector.recovered`，正常采样间隔恢复为 10 秒。采集错误不触发榜首邮件，也不推进有效比较基线。
 
 ## 历史页面与导出
 
@@ -138,8 +157,9 @@ beauclaw serve
 | 榜单注册表、通知邮箱、旧版历史 | `~/.local/share/beauclaw/beauclaw.sqlite3` |
 | 新增赛事历史与发信队列 | `~/.local/share/beauclaw/rankings/六位短名.sqlite3` |
 | 后台日志 | `~/.local/share/beauclaw/beauclaw.log` |
+| 独立警告与错误日志 | `~/.local/share/beauclaw/beauclaw.errors.log` |
 | 独立登录浏览器 | `~/.local/share/beauclaw/browser-profile/` |
-| 安装版本 | `~/.local/share/beauclaw/app/v0.4.2/` |
+| 安装版本 | `~/.local/share/beauclaw/app/v0.5.0/` |
 
 路径尊重 XDG 设置；`BEAUCLAW_CONFIG_DIR` / `BEAUCLAW_DATA_DIR` 可重定向目录。凭据文件权限为 `0600`。`BEAUCLAW_TOKEN` / `BEAUCLAW_SMTP_PASSWORD` 可提供环境变量凭据。每轮重新读取配置。
 
@@ -151,7 +171,7 @@ beauclaw serve
 - 通知的前十名与触发事件来自同一次快照，队名与分数经过 HTML 转义。邮件同时包含中文 HTML 和纯文本版本，采样时间使用北京时间。正式通知标注“关键邮件”并设置高重要性邮件头；测试邮件不标重要性。升级前排队的同队降分通知会取消投递，记录仍保留。
 - 每个邮箱独立入队、投递、退避和重试。删除或重新添加邮箱后不会收到旧订阅的排队邮件。
 - SMTP 接受后不再重发；连接在服务器接受后断开或进程在确认落盘前退出，仍可能造成重试重复。SMTP 接受不等于最终进入收件箱。
-- 休眠、关机或退出会中断采集，失败与限流会延长采样间隔。普通快照按上述规则自动清理；关键记录、变化日志和进程日志不自动清理。
+- 休眠、关机或退出会中断采集，失败与限流会延长采样间隔。普通快照自动清理，进程日志按大小轮转；关键记录与榜单变化事件永久保留。
 
 记录只能反映实际观测到的公开成绩，不能证明有人故意藏榜，也无法观测从未公开或在两次采样间出现又消失的成绩。
 

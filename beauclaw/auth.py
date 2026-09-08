@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import getpass
+import base64
+from datetime import datetime, timezone
 import json
 import os
 import shlex
@@ -14,6 +16,34 @@ from urllib.parse import urlsplit
 
 from beauclaw.core import API_ORIGIN, InvalidBoard, fetch, parse_board, utcnow
 from beauclaw.ui import activity
+
+
+def credential_stamp(auth_file: Path, token_file: Path | None = None):
+    """Watch only the credential source that load_auth actually uses."""
+    if token_file is None and os.environ.get("BEAUCLAW_TOKEN", "").strip():
+        return None
+    try:
+        stat = (token_file or auth_file).stat()
+        return stat.st_ino, stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return ()
+
+
+def credential_metadata(auth: dict, token_file: Path | None = None) -> dict:
+    source = "token_file" if token_file else "environment" if os.environ.get("BEAUCLAW_TOKEN", "").strip() else "saved_session"
+    result = {"credential_source": source}
+    # JWT timestamps are diagnostic hints only; API validation decides validity.
+    token = auth.get("token", "").removeprefix("Bearer ")
+    try:
+        encoded = token.split(".")[1]
+        if len(encoded) <= 20000:
+            claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+            if type(claims.get("exp")) in (int, float):
+                expiry = datetime.fromtimestamp(claims["exp"], timezone.utc)
+                result.update(expires_at=expiry.isoformat(), expired=expiry <= datetime.now(timezone.utc))
+    except (ValueError, IndexError, TypeError, AttributeError, OverflowError, OSError):
+        pass
+    return result
 
 
 def load_auth(auth_file: Path, token_file: Path | None = None) -> dict:

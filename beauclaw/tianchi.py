@@ -7,9 +7,11 @@ import json
 import math
 import re
 import time
+import threading
 from urllib.parse import urlencode
 
 from beauclaw.core import InvalidBoard, Response, dumps, fetch_url, score_text, utcnow
+from beauclaw.diagnostics import exception_details, sanitize
 
 ORIGIN = "https://tianchi.aliyun.com"
 API = ORIGIN + "/v3/proxy/competition/api/race/"
@@ -84,14 +86,23 @@ def fetch(event_id: str, auth: dict | None = None, timeout: float = 8) -> Respon
     # Public requests intentionally use no credentials, cookies or GitCode tokens.
     started, deadline = utcnow(), time.monotonic() + timeout
     bundle = {"provider": "tianchi", "competition_id": event_id, "pages": []}
+    diagnostics = {"requests": [], "timeout_seconds": timeout}
+    request_lock = threading.Lock()
     headers = {"User-Agent": "Mozilla/5.0 BeauClaw", "Accept": "application/json",
                "Cache-Control": "no-cache", "Referer": page_url(event_id)}
 
-    def request(url: str) -> dict:
+    def request(url: str, phase: str, page: int | None = None) -> dict:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            with request_lock:
+                diagnostics["requests"].append({"endpoint": url, "phase": phase, "page": page,
+                                                "http_status": None, "category": "network_timeout",
+                                                "deadline_exceeded": True})
             raise InvalidBoard("Tianchi snapshot exceeded the request timeout; incomplete pages were not compared")
         response = fetch_url(url, headers, remaining)
+        with request_lock:
+            diagnostics["requests"].append({**response.diagnostics, "endpoint": url,
+                                            "phase": phase, "page": page, "http_status": response.status})
         if response.error or response.status != 200:
             raise RequestFailed(response)
         if time.monotonic() > deadline:
@@ -101,12 +112,12 @@ def fetch(event_id: str, auth: dict | None = None, timeout: float = 8) -> Respon
 
     error, status, evidence_headers = None, 200, {}
     try:
-        bundle["detail"] = request(API + "getDetail?" + urlencode({"raceId": event_id}))
+        bundle["detail"] = request(API + "getDetail?" + urlencode({"raceId": event_id}), "detail")
         detail = unpack(bundle["detail"]["body"])
         season = current_season(detail)
         if season and detail.get("showLeaderBoard") is not False:
-            def get_page(page: int) -> dict:
-                return request(API + "rank/list?" + urlencode({"pageNum": page, "season": season["seasonNum"], "raceId": event_id}))
+            def get_page(page: int, phase: str = "page") -> dict:
+                return request(API + "rank/list?" + urlencode({"pageNum": page, "season": season["seasonNum"], "raceId": event_id}), phase, page)
             first = get_page(1)
             bundle["pages"].append(first)
             first_data = unpack(first["body"])
@@ -115,17 +126,21 @@ def fetch(event_id: str, auth: dict | None = None, timeout: float = 8) -> Respon
                 with ThreadPoolExecutor(max_workers=4, thread_name_prefix="tianchi-pages") as pool:
                     bundle["pages"].extend(pool.map(get_page, range(2, count + 1)))
                 # Check the leading page again to reject a change during pagination.
-                confirmation = get_page(1)
+                confirmation = get_page(1, "confirmation")
                 bundle["confirmation"] = confirmation
                 confirmed = unpack(confirmation["body"])
                 if any(first_data.get(key) != confirmed.get(key) for key in ("total", "list", "scoreShowConfig")):
                     raise InvalidBoard("Tianchi leaderboard changed during pagination; retrying a complete snapshot")
     except (ValueError, OSError) as exc:
         error = str(exc) if isinstance(exc, InvalidBoard) else f"Tianchi snapshot failed ({type(exc).__name__})"
+        diagnostics["exception"] = exception_details(exc)
         if isinstance(exc, RequestFailed):
             status, evidence_headers = exc.response.status, exc.response.headers
+            if exc.response.diagnostics.get("category"):
+                diagnostics["category"] = exc.response.diagnostics["category"]
             bundle["failed_request"] = {"url": exc.response.url, "body": exc.response.body.decode("utf-8", errors="replace")}
-    return Response(started, utcnow(), page_url(event_id), status, dumps(bundle).encode(), headers=evidence_headers, error=error)
+    return Response(started, utcnow(), page_url(event_id), status, dumps(bundle).encode(),
+                    headers=evidence_headers, error=error, diagnostics=sanitize(diagnostics))
 
 
 def display_score(score: str, pattern: str | None) -> str:
@@ -138,10 +153,12 @@ def display_score(score: str, pattern: str | None) -> str:
 
 
 def parse_board(body: bytes, observed_at: str) -> dict:
+    location = {"phase": "bundle"}
     try:
         bundle = json.loads(body)
         if bundle.get("provider") != "tianchi" or not str(bundle.get("competition_id", "")).isdigit():
             raise InvalidBoard("Snapshot is not a Tianchi competition bundle")
+        location = {"phase": "detail"}
         detail = unpack(bundle["detail"]["body"])
         race = detail["race"]
         if str(race["raceId"]) != bundle["competition_id"]:
@@ -156,17 +173,21 @@ def parse_board(body: bytes, observed_at: str) -> dict:
         pages = bundle["pages"]
         if not isinstance(pages, list) or not pages:
             raise InvalidBoard("Tianchi snapshot has no leaderboard pages")
+        location = {"phase": "page", "page": 1}
         first = unpack(pages[0]["body"])
         total, count = pagination(first)
         if len(pages) != count:
             raise InvalidBoard("Tianchi snapshot is incomplete; not all leaderboard pages were captured")
         if count > 1:
+            location = {"phase": "confirmation", "page": 1}
             confirmation = unpack(bundle["confirmation"]["body"])
             if any(first.get(key) != confirmation.get(key) for key in ("total", "list", "scoreShowConfig")):
                 raise InvalidBoard("Tianchi leaderboard changed during pagination; retrying a complete snapshot")
+        location = {"phase": "page", "page": 1}
         config = next((item for item in first.get("scoreShowConfig", []) if item.get("name") == "score"), {})
         members, previous_rank = {}, 1
         for page_number, page in enumerate(pages, 1):
+            location = {"phase": "page", "page": page_number}
             data = unpack(page["body"])
             if data.get("pageNum") != page_number or pagination(data) != (total, count):
                 raise InvalidBoard("Tianchi pagination changed; the snapshot was not compared")
@@ -174,7 +195,8 @@ def parse_board(body: bytes, observed_at: str) -> dict:
             expected = min(first["pageSize"], max(0, total - (page_number - 1) * first["pageSize"]))
             if not isinstance(rows, list) or len(rows) != expected:
                 raise InvalidBoard("Tianchi leaderboard page is incomplete")
-            for row in rows:
+            for row_number, row in enumerate(rows, 1):
+                location = {"phase": "page", "page": page_number, "row": row_number}
                 if not isinstance(row, dict):
                     raise InvalidBoard(f"Tianchi page {page_number} contains an invalid team row")
                 if str(row.get("raceId")) != bundle["competition_id"] or str(row.get("seasonId")) != result["schedule_id"]:
@@ -209,5 +231,9 @@ def parse_board(body: bytes, observed_at: str) -> dict:
         return result
     except (KeyError, TypeError, AttributeError, ValueError) as exc:
         if isinstance(exc, InvalidBoard):
+            exc.diagnostics = location
             raise
-        raise InvalidBoard("Invalid Tianchi leaderboard structure; the snapshot was not compared") from None
+        field = f" (missing field: {exc.args[0]})" if isinstance(exc, KeyError) and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,63}", str(exc.args[0])) else f" ({type(exc).__name__})"
+        error = InvalidBoard(f"Invalid Tianchi leaderboard structure{field}; the snapshot was not compared")
+        error.diagnostics = location
+        raise error from exc

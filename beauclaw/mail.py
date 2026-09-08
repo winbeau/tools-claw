@@ -21,6 +21,7 @@ from beauclaw.core import Store, fetch, should_notify_leader, top_ten, utcnow
 from beauclaw.email_template import render_email
 from beauclaw.ui import activity
 from beauclaw.paths import config_dir
+from beauclaw.diagnostics import event, exception_details, remember_secrets
 
 PROVIDERS = {"aliyun": {"host": "smtpdm.aliyun.com", "ports": (25, 80, 465), "port": 465}}
 
@@ -55,6 +56,7 @@ def load_mail_config(path: Path) -> dict:
     password = os.environ.get("BEAUCLAW_SMTP_PASSWORD") or config.get("password")
     if not isinstance(password, str) or not password:
         raise ValueError("SMTP password is missing; run beauclaw config set mail.password")
+    remember_secrets({"password": password})
     return {**config, "provider": provider, "host": PROVIDERS[provider]["host"], "port": port,
             "security": "ssl" if port == 465 else "starttls", "username": config["sender"],
             "password": password, "boards": ["realtime_region_ranking"]}
@@ -202,12 +204,17 @@ def deliver_one(store: Store, config: dict) -> bool:
         with store.db:
             store.db.execute("UPDATE mail_outbox SET attempts=?,next_attempt=?,last_error=? WHERE id=?",
                              (attempts, time.time() + delay, error, row["id"]))
-        print(f"Email #{row['id']} failed: {error}; retry in {delay}s.", flush=True)
+        event("mail.failed", f"Email delivery failed: {error}", "ERROR", ranking=payload.get("ranking_id"),
+              provider=store.provider, poll_id=row["poll_id"], mail_id=row["id"], recipient_id=current_notice["short_id"],
+              attempts=attempts, retry_in_seconds=delay,
+              next_attempt_at=(datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="milliseconds"),
+              exception=exception_details(exc))
     else:
         with store.db:
             store.db.execute("UPDATE mail_outbox SET attempts=attempts+1,sent_at=?,last_error=NULL WHERE id=?",
                              (utcnow(), row["id"]))
-        print(f"Leader-change email #{row['id']} accepted by SMTP (snapshot #{row['poll_id']}).", flush=True)
+        event("mail.accepted", "Leader-change email accepted by SMTP", ranking=payload.get("ranking_id"),
+              provider=store.provider, poll_id=row["poll_id"], mail_id=row["id"], recipient_id=current_notice["short_id"])
     return True
 
 
@@ -219,20 +226,28 @@ class MailWorker(threading.Thread):
         self.stop_event, self.wake = threading.Event(), threading.Event()
 
     def run(self):
-        store = Store(self.db_path, notice_db=self.notice_db)
-        try:
-            while not self.stop_event.is_set():
-                try:
+        while not self.stop_event.is_set():
+            store = None
+            try:
+                store = Store(self.db_path, notice_db=self.notice_db)
+                while not self.stop_event.is_set():
                     if self.config_path.exists() and (self.active is None or self.active()):
-                        config = load_mail_config(self.config_path)
-                        if deliver_one(store, config):
+                        try:
+                            config = load_mail_config(self.config_path)
+                        except ValueError:
+                            config = None  # The collector reports configuration errors.
+                        if config and deliver_one(store, config):
                             continue
-                except ValueError:
-                    pass  # The poll loop reports invalid configuration; keep the queue intact.
-                self.wake.wait(2)
-                self.wake.clear()
-        finally:
-            store.close()
+                    self.wake.wait(2)
+                    self.wake.clear()
+            except Exception as exc:
+                event("mail.worker_error", "Mail worker failed; reopening its queue in 10s", "ERROR",
+                      ranking=self.db_path.stem if re.fullmatch(r"[0-9a-f]{6}", self.db_path.stem) else None,
+                      exception=exception_details(exc), retry_in_seconds=10)
+                self.stop_event.wait(10)
+            finally:
+                if store:
+                    store.close()
 
     def close(self):
         self.stop_event.set()

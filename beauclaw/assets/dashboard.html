@@ -58,8 +58,13 @@ function render(){
   $('retention').textContent=`关键快照 ${summary.critical_poll_count??0} 份，永久保留 · 普通快照保留 ${summary.snapshot_limit??100} 份；仍在使用的比较基线受保护`;
   if(latest){const age=Math.max(0,Math.round((Date.now()-new Date(latest.captured_at))/1000));
     const labels={ok:'采样成功',error:'采样失败',sealed:'赛程已封榜',unavailable:'榜单暂不可用'};
-    const stale=age>Math.max(30,summary.interval_seconds*3);
-    $('health').innerHTML=`<span class="${latest.status==='ok'&&!stale?'good':'warn'}">● ${esc(labels[latest.status]||latest.status)}</span> · 最后采样 ${esc(date(latest.captured_at))}（${age}s 前）${stale?' · 暂无新样本，请检查采集进程':''} · ${esc(latest.error||latest.info.reason||'')}`;
+    const runtime=summary.runtime||{}, diagnostic=latest.diagnostics||{}, retryAt=runtime.next_attempt_at?new Date(runtime.next_attempt_at):null;
+    const retrying=runtime.state==='backoff'&&retryAt&&Date.now()<retryAt.getTime()+30000;
+    const stale=age>Math.max(30,summary.interval_seconds*3)&&!retrying;
+    const reasons={auth_expired:'登录会话已过期或失效',auth_config:'登录凭据配置错误',rate_limit:'接口限流',access_denied:'接口拒绝访问',http_error:'接口 HTTP 错误',network_timeout:'请求超时',network_dns:'DNS 解析失败',network_tls:'TLS 连接失败',network_connect:'网络连接失败',snapshot_changed:'分页期间榜单发生变化',api_error:'接口业务错误',schema_error:'榜单数据校验失败'};
+    const category=diagnostic.category, hint=category==='auth_expired'?(diagnostic.auth?.credential_source==='environment'?'请更新或取消 BEAUCLAW_TOKEN 并重启':'请运行 beauclaw login --browser，登录后自动重试'):category==='snapshot_changed'?'正在重新采集完整榜单':'';
+    const progress=retrying?` · 连续失败 ${runtime.consecutive_failures||1} 次 · ${Math.max(0,Math.ceil((retryAt-Date.now())/1000))}s 后重试（${date(runtime.next_attempt_at)}）`:runtime.state==='fetching'?' · 正在采集':runtime.state==='stopped'?' · 采集已停止':runtime.state==='crashed'?' · 采集器异常，等待恢复':'';
+    $('health').innerHTML=`<span class="${latest.status==='ok'&&!stale?'good':'warn'}">● ${esc(labels[latest.status]||latest.status)}</span> · 最后采样 ${esc(date(latest.captured_at))}（${age}s 前）${esc(progress)}${stale?' · 暂无新样本，请检查采集进程':''}${category?' · '+esc(reasons[category]||category):''}${hint?' · '+esc(hint):''}${latest.error||latest.info.reason?' · '+esc(latest.error||latest.info.reason):''}`;
   }else $('health').textContent=summary.provider==='tianchi'?'尚无快照，请启动采集。':'尚无快照，请先登录并启动采集。';
   $('mailHealth').textContent=`邮件通知：${summary.notice_count} 个通知邮箱 · SMTP 已接受 ${summary.mail_sent} 封 · 待发送 ${summary.mail_pending} 封${summary.mail_last_error?' · 最近错误：'+summary.mail_last_error:''}`;
   const members=Object.values(state?.members||{}), below=m=>lowerThan(m.entry.score,m.peak_score);

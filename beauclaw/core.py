@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 import uuid
 import zlib
 from dataclasses import dataclass, field
@@ -13,6 +14,9 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from beauclaw.diagnostics import (ACTIONS, api_metadata, exception_details, failure_category,
+                                  network_category, remember_secrets, sanitize)
 
 DEFAULT_COMPETITION = "2094722369343447042"
 SNAPSHOT_LIMIT = 100
@@ -76,9 +80,11 @@ class Response:
     body: bytes = b""
     headers: dict = field(default_factory=dict)
     error: str | None = None
+    diagnostics: dict = field(default_factory=dict)
 
 
 def fetch(event_id: str, auth: dict, timeout: float = 8) -> Response:
+    remember_secrets(auth)
     url = api_url(event_id)
     headers = {
         "User-Agent": "Mozilla/5.0 BeauClaw/0.1",
@@ -95,7 +101,8 @@ def fetch(event_id: str, auth: dict, timeout: float = 8) -> Response:
 
 
 def fetch_url(url: str, headers: dict, timeout: float = 8) -> Response:
-    started = utcnow()
+    started, tick = utcnow(), time.perf_counter()
+    diagnostics = {"endpoint": url, "timeout_seconds": round(timeout, 3)}
     try:
         try:
             response = urlopen(Request(url, headers=headers), timeout=timeout)
@@ -107,12 +114,21 @@ def fetch_url(url: str, headers: dict, timeout: float = 8) -> Response:
                             if k.lower() in {"date", "content-type", "etag", "last-modified",
                                              "age", "retry-after", "cache-control", "x-request-id"}}
             body = response.read(20 * 1024 * 1024 + 1)
+            diagnostics.update(duration_ms=round((time.perf_counter() - tick) * 1000, 1),
+                               response_bytes=len(body), http_status=response.code,
+                               api=api_metadata(body), headers=safe_headers)
             if len(body) > 20 * 1024 * 1024:
                 return Response(started, utcnow(), url, response.code, headers=safe_headers,
-                                error="Response exceeds 20 MiB; truncated data was not compared")
-            return Response(started, utcnow(), url, response.code, body, safe_headers)
+                                error="Response exceeds 20 MiB; truncated data was not compared", diagnostics=sanitize(diagnostics))
+            return Response(started, utcnow(), url, response.code, body, safe_headers, diagnostics=sanitize(diagnostics))
     except (URLError, OSError, ValueError) as exc:
-        return Response(started, utcnow(), url, None, error=f"Network request failed: {type(exc).__name__}")
+        category = network_category(exc)
+        diagnostics.update(category=category, exception=exception_details(exc),
+                           duration_ms=round((time.perf_counter() - tick) * 1000, 1))
+        reason = getattr(exc, "reason", exc)
+        return Response(started, utcnow(), url, None,
+                        error=f"Network request failed ({category}: {type(reason).__name__})",
+                        diagnostics=sanitize(diagnostics))
 
 
 class InvalidBoard(ValueError):
@@ -343,6 +359,8 @@ class Store:
                 self.db.execute("ALTER TABLE polls ADD COLUMN critical INTEGER NOT NULL DEFAULT 0")
             if "critical_reason" not in columns:
                 self.db.execute("ALTER TABLE polls ADD COLUMN critical_reason TEXT")
+            if "diagnostics_json" not in columns:
+                self.db.execute("ALTER TABLE polls ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'")
             self.db.execute("CREATE INDEX IF NOT EXISTS polls_critical_id ON polls(critical,id)")
             self.db.execute("CREATE INDEX IF NOT EXISTS polls_body ON polls(body_sha256)")
             if not self.db.execute("SELECT 1 FROM meta WHERE key='snapshot_retention_v1'").fetchone():
@@ -391,12 +409,13 @@ class Store:
     def record(self, response: Response, missing_samples: int = 2,
                mail_policy: dict | None = None) -> tuple[dict, list]:
         error = response.error
+        diagnostics = dict(response.diagnostics)
         info: dict = {}
         if error:
             status = "error"
         elif response.status != 200:
             status = "error"
-            error = {401: "Session missing or expired; run beauclaw login",
+            error = {401: "Session missing or expired; run beauclaw login --browser",
                      403: "API access denied", 418: "Request blocked by the site", 429: "API rate limit reached; retrying later"}.get(
                          response.status, f"API HTTP {response.status}")
         else:
@@ -409,6 +428,14 @@ class Store:
                 status = info["status"]
             except InvalidBoard as exc:
                 status, error = "error", str(exc)
+                diagnostics.update(exception=exception_details(exc))
+                if getattr(exc, "diagnostics", None):
+                    diagnostics["validation"] = exc.diagnostics
+        category = failure_category(response.status, error, diagnostics)
+        if category:
+            diagnostics.update(category=category, action=ACTIONS.get(category))
+        diagnostics = sanitize(diagnostics)
+        error = sanitize(error)
         sha = hashlib.sha256(response.body).hexdigest()
         events = []
         with self.db:
@@ -416,9 +443,9 @@ class Store:
             metadata = {key: value for key, value in info.items() if key != "boards"}
             metadata["counts"] = {key: len(value) for key, value in info.get("boards", {}).items()}
             cursor = self.db.execute("""INSERT INTO polls
-                (started_at,captured_at,url,http_status,status,body_sha256,headers_json,info_json,error)
-                VALUES (?,?,?,?,?,?,?,?,?)""", (response.started_at, response.captured_at, response.url,
-                    response.status, status, sha, dumps(response.headers), dumps(metadata), error))
+                (started_at,captured_at,url,http_status,status,body_sha256,headers_json,info_json,error,diagnostics_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""", (response.started_at, response.captured_at, response.url,
+                    response.status, status, sha, dumps(response.headers), dumps(metadata), error, dumps(diagnostics)))
             poll_id = cursor.lastrowid
             if status == "ok":
                 for board_key, members in info["boards"].items():
@@ -465,7 +492,14 @@ class Store:
                                         (poll_id, notice["email"], f"<{uuid.uuid4().hex}@beauclaw.local>", dumps(message)))
             self._prune_snapshots()
         return {"id": poll_id, "status": status, "error": error, "captured_at": response.captured_at,
-                "info": metadata, "http_status": response.status, "critical": critical}, events
+                "info": metadata, "http_status": response.status, "critical": critical, "diagnostics": diagnostics}, events
+
+    def set_runtime(self, **fields) -> None:
+        with self.db:
+            row = self.db.execute("SELECT value FROM meta WHERE key='collector_runtime'").fetchone()
+            previous = json.loads(row[0]) if row else {}
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES ('collector_runtime',?)",
+                            (dumps(sanitize({**previous, "updated_at": utcnow(), **fields})),))
 
     def summary(self) -> dict:
         def poll(row: Any) -> dict | None:
@@ -474,6 +508,7 @@ class Store:
             value = dict(row)
             value["critical"] = bool(value["critical"])
             value["info"] = json.loads(value.pop("info_json"))
+            value["diagnostics"] = json.loads(value.pop("diagnostics_json"))
             value.pop("headers_json")
             return value
         # Each dashboard refresh reads one consistent committed snapshot.
@@ -484,11 +519,13 @@ class Store:
             states = [json.loads(row[0]) for row in self.db.execute("SELECT state_json FROM states")]
             event_id = self.db.execute("SELECT value FROM meta WHERE key='competition_id'").fetchone()
             interval = self.db.execute("SELECT value FROM meta WHERE key='interval_seconds'").fetchone()
+            runtime = self.db.execute("SELECT value FROM meta WHERE key='collector_runtime'").fetchone()
             return {"competition_id": event_id[0] if event_id else None, "provider": self.provider,
                     "provider_name": self.source.name, "primary_board": self.source.primary_board,
                     "source_url": self.source.url(event_id[0]) if event_id else None, "latest": latest,
                     "last_valid": good, "states": states, "kinds": KINDS,
                     "interval_seconds": float(interval[0]) if interval else 10,
+                    "runtime": json.loads(runtime[0]) if runtime else {},
                     "mail_pending": self.db.execute("SELECT count(*) FROM mail_outbox WHERE sent_at IS NULL AND cancelled_at IS NULL").fetchone()[0],
                     "mail_sent": self.db.execute("SELECT count(*) FROM mail_outbox WHERE sent_at IS NOT NULL").fetchone()[0],
                     "notice_count": len(self.notices()),
@@ -561,7 +598,7 @@ class Store:
         result = dict(row)
         result["critical"] = bool(result["critical"])
         result["raw_body"] = zlib.decompress(result.pop("compressed")).decode("utf-8", errors="replace")
-        for key in ("headers", "info"):
+        for key in ("headers", "info", "diagnostics"):
             result[key] = json.loads(result.pop(f"{key}_json"))
         return result
 

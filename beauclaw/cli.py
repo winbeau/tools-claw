@@ -7,6 +7,8 @@ import csv
 import fcntl
 import json
 import math
+import os
+import re
 import signal
 import sys
 import threading
@@ -18,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from beauclaw.auth import load_auth, login
+from beauclaw.auth import credential_metadata, credential_stamp, load_auth, login
 from beauclaw.core import DEFAULT_COMPETITION, KINDS, Response, Store, competition_id, dumps, fetch, utcnow
 from beauclaw.mail import MailWorker, configure_mail, load_mail_config, mail_policy, show_config, test_mail
 from beauclaw.paths import config_dir, data_dir
@@ -26,6 +28,7 @@ from beauclaw import __version__
 from beauclaw.service import Service, mark_worker
 from beauclaw.rankings import Rankings, ranking_status
 from beauclaw.ui import activity, set_animation
+from beauclaw.diagnostics import LEVELS, event, exception_details, human_line, log_session, read_logs
 
 ROOT = Path(__file__).resolve().parent
 
@@ -99,6 +102,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_error(400)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception as exc:
+            event("dashboard.failed", "Dashboard request failed", "ERROR", exception=exception_details(exc), endpoint=path.path)
+            self.send_error(500)
 
     def reply(self, data: bytes, content_type: str) -> None:
         self.send_response(200)
@@ -116,6 +122,16 @@ def server_for(db_path: Path, port: int) -> ThreadingHTTPServer:
 
 
 def watch(args) -> int:
+    with log_session(args.db, getattr(args, "log_level", "INFO"), console=not getattr(args, "service_token", None)):
+        try:
+            return _watch(args)
+        except Exception as exc:
+            event("monitor.failed", "Monitor stopped unexpectedly", "ERROR", exception=exception_details(exc))
+            raise
+
+
+def _watch(args) -> int:
+    from beauclaw.monitor import report_poll, wait_for_retry
     if args.competition is None:
         from beauclaw.monitor import watch_all
         return watch_all(args)
@@ -132,27 +148,33 @@ def watch(args) -> int:
         previous_signals = {sig: signal.signal(sig, lambda *_: stop.set()) for sig in (signal.SIGINT, signal.SIGTERM)}
         server = None
         mail_worker = None
+        context = {"provider": "gitcode", "competition_id": args.competition}
         try:
             if not args.no_web and not args.once:
                 server = server_for(args.db, args.port)
                 threading.Thread(target=server.serve_forever, daemon=True).start()
-                print(f"Dashboard: http://127.0.0.1:{server.server_port}", flush=True)
-            print(f"Competition {args.competition}; interval {args.interval:g}s; database {args.db}", flush=True)
+                event("dashboard.started", f"Dashboard: http://127.0.0.1:{server.server_port}")
+            event("monitor.started", f"Competition {args.competition}; interval {args.interval:g}s", **context)
             if not args.no_mail:
                 mail_worker = MailWorker(args.db, args.mail_config)
                 mail_worker.start()
-                print("Mail notifications: configured" if args.mail_config.exists() else "Mail notifications: not configured; run beauclaw config set", flush=True)
+                event("mail.config", "Mail notifications: configured" if args.mail_config.exists() else "Mail notifications: not configured; run beauclaw config set", **context)
             failures, samples, failed = 0, 0, False
             last_mail_error = None
             mark_worker(args, "running")
             while not stop.is_set():
                 started = time.monotonic()
+                store.set_runtime(state="fetching", pid=os.getpid(), consecutive_failures=failures,
+                                  next_attempt_at=None, retry_in_seconds=None, **context)
+                stamp = credential_stamp(args.auth_file, args.token_file)
                 try:
                     auth = load_auth(args.auth_file, args.token_file)
                     response = fetch(args.competition, auth, args.timeout)
+                    response.diagnostics["auth"] = credential_metadata(auth, args.token_file)
                 except (OSError, ValueError) as exc:
                     response = Response(utcnow(), utcnow(), "", None,
-                                        error=f"Could not read local credentials ({type(exc).__name__}); check the file or sign in again")
+                                        error=f"Could not read local credentials ({type(exc).__name__}); check the file or sign in again",
+                                        diagnostics={"category": "auth_config", "exception": exception_details(exc)})
                 policy = None
                 if not args.no_mail and args.mail_config.exists():
                     try:
@@ -160,31 +182,21 @@ def watch(args) -> int:
                         last_mail_error = None
                     except ValueError as exc:
                         if str(exc) != last_mail_error:
-                            print(f"Mail configuration error: {exc}", flush=True)
+                            event("mail.config_error", "Invalid mail configuration; check beauclaw config show", "ERROR",
+                                  **context, exception=exception_details(exc))
                         last_mail_error = str(exc)
                 poll, events = store.record(response, args.missing_samples, mail_policy=policy)
                 if mail_worker:
                     mail_worker.wake.set()
                 samples += 1
                 failed = poll["status"] == "error"
+                previous_failures = failures
                 failures = failures + 1 if failed else 0
-                message = poll["error"] or poll["info"].get("reason") or " / ".join(
-                    f"{key.removeprefix('realtime_')}: {count}" for key, count in poll["info"]["counts"].items())
-                delay = retry_delay(response, failures, args.interval)
-                print(f"[{poll['captured_at']}] #{poll['id']} {poll['status']} {message}"
-                      + (f"; retry in {delay:g}s" if failed else ""), flush=True)
-                for event in events:
-                    if event["kind"] == "rank_changed":
-                        continue  # All rank changes are persisted; keep the terminal readable.
-                    before, after = event["before"], event["after"]
-                    change = f" {before['score']} → {after['score']}" if before and after else ""
-                    print(f"  {event['kind'].replace('_', ' ')} {event['name']}{change} [{event['scope']}]", flush=True)
+                wait = report_poll(store, context, poll, events, response, failures, previous_failures, started, args)
                 if args.once or (args.samples and samples >= args.samples):
                     break
-                # Fixed start-to-start interval; no overlapping requests or catch-up bursts.
-                wait = delay if failed else max(0, args.interval - (time.monotonic() - started))
-                stop.wait(wait)
-            print("Collection stopped. All completed snapshots have been saved.", flush=True)
+                wait_for_retry(stop, wait, args, stamp, poll["diagnostics"].get("category"), context)
+            event("monitor.stopped", "Collection stopped. All completed snapshots have been saved.", **context)
             return 1 if (args.once or args.samples) and failed else 0
         finally:
             if mail_worker:
@@ -192,6 +204,7 @@ def watch(args) -> int:
             if server:
                 server.shutdown()
                 server.server_close()
+            store.set_runtime(state="stopped", next_attempt_at=None, retry_in_seconds=None)
             store.close()
             mark_worker(args, "stopped")
             for sig, handler in previous_signals.items():
@@ -257,6 +270,14 @@ def main() -> int:
     test.add_argument("--token-file", type=Path)
     test.add_argument("--ranking", help="Use this six-character ranking ID; defaults to the first ranking")
     test.set_defaults(notice_command="test")
+    logs = commands.add_parser("logs", help="Inspect rotating logs and request diagnostics")
+    logs.add_argument("--db", type=Path, default=data_dir() / "beauclaw.sqlite3")
+    logs.add_argument("-n", "--lines", type=int, default=50, help="Show the last N matching records (default: 50)")
+    logs.add_argument("-f", "--follow", action="store_true", help="Follow new records, including log rotation")
+    logs.add_argument("--ranking", help="Filter by six-character ranking ID, including deleted rankings")
+    logs.add_argument("--level", type=str.upper, choices=LEVELS, default="DEBUG", help="Minimum severity")
+    logs.add_argument("--errors", action="store_true", help="Read the separate warning/error history")
+    logs.add_argument("--json", action="store_true", help="Output structured JSON lines")
     for name in ("login", "watch", "start", "stop", "status", "serve", "export", "snapshot"):
         command = commands.add_parser(name)
         if name in ("login", "watch", "start"):
@@ -267,6 +288,7 @@ def main() -> int:
             command.add_argument("--db", type=Path, default=data_dir() / "beauclaw.sqlite3")
         if name in ("watch", "start"):
             command.add_argument("--mail-config", type=Path, default=config_dir() / "mail.json")
+            command.add_argument("--log-level", type=str.upper, choices=LEVELS, default="INFO", help="Log verbosity; DEBUG includes successful request diagnostics")
         if name == "login":
             modes = command.add_mutually_exclusive_group()
             modes.add_argument("--browser", action="store_true", help="Open a browser for sign-in and save the verified session")
@@ -298,7 +320,20 @@ def main() -> int:
     args = parser.parse_args()
     set_animation(not args.no_animation)
     try:
-        if args.command == "ranking":
+        if args.command == "logs":
+            if args.lines < 0 or args.lines > 10000:
+                raise ValueError("Log line count must be between 0 and 10000")
+            if args.ranking and not re.fullmatch(r"[0-9a-fA-F]{6}", args.ranking):
+                raise ValueError("Provide a six-character ranking ID from beauclaw ranking list")
+            path = args.db.with_suffix(".errors.log" if args.errors else ".log")
+            found = False
+            for value in read_logs(path, lines=args.lines, follow=args.follow,
+                                   ranking=args.ranking.lower() if args.ranking else None, level=args.level):
+                print(dumps(value) if args.json else human_line(value), flush=True)
+                found = True
+            if not found and not args.json:
+                print("No matching log records. Start BeauClaw to begin logging.")
+        elif args.command == "ranking":
             with Rankings(args.db) as registry:
                 if args.ranking_command == "add":
                     with activity("Loading competition details..."):
@@ -403,11 +438,23 @@ def main() -> int:
                     print(f"Critical snapshots: {summary['critical_poll_count']} (retained); ordinary snapshot limit: {summary['snapshot_limit']} per ranking; active comparison baselines protected")
                 else:
                     print("No samples recorded yet.")
-                print(f"Monitored rankings: {len(monitored)}")
+                failing = sum(1 for item in samples if item["latest"] and item["latest"]["status"] == "error")
+                print(f"Monitored rankings: {len(monitored)}; failing: {failing}")
                 for row in monitored:
                     latest = (row["observations"] or {}).get("latest")
                     detail = f"{latest['status']} at {latest['captured_at']}" if latest else "waiting for the first sample"
                     print(f"  {row['short_id']}-{row['name']}: {detail}")
+                    observation = row["observations"] or {}
+                    runtime = observation.get("runtime", {})
+                    if latest and latest["status"] == "error":
+                        diagnostics = latest.get("diagnostics", {})
+                        print(f"    {diagnostics.get('category', 'error')}: {latest['error']}")
+                        if runtime.get("action") or diagnostics.get("action"):
+                            print(f"    {runtime.get('action') or diagnostics['action']}")
+                    if runtime:
+                        print(f"    Collector: {runtime.get('state')}; consecutive failures: {runtime.get('consecutive_failures', 0)}"
+                              + (f"; next attempt: {runtime['next_attempt_at']}" if state["running"] and runtime.get("next_attempt_at") else ""))
+                print("Use beauclaw logs --errors or beauclaw logs -f for diagnostics.")
         else:
             if not args.db.is_file():
                 raise ValueError("No database found; start monitoring first")

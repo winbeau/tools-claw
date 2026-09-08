@@ -48,6 +48,7 @@ class Service:
         self.session = "beauclaw"
         self.state_path = self.db.with_suffix(".service.json")
         self.log_path = self.db.with_suffix(".log")
+        self.console_path = self.db.with_suffix(".console.log")
         self.lock_path = self.db.with_suffix(".control.lock")
 
     def tmux(self, *args: str) -> subprocess.CompletedProcess:
@@ -76,6 +77,7 @@ class Service:
         return {"state": "running" if running else "starting" if pid else "stopped",
                 "running": running, "pid": pid, "started_at": saved.get("started_at"),
                 "version": saved.get("version"), "db": str(self.db), "log": str(self.log_path),
+                "error_log": str(self.db.with_suffix(".errors.log")), "startup_log": str(self.console_path),
                 "dashboard": saved.get("dashboard"), "socket": self.socket, "session": self.session,
                 "attach_command": shlex.join(["tmux", "-L", self.socket, "attach", "-t", self.session])}
 
@@ -94,6 +96,7 @@ class Service:
                        "--missing-samples", str(args.missing_samples), "--port", str(args.port),
                        "--auth-file", str(args.auth_file.expanduser().resolve()),
                        "--mail-config", str(args.mail_config.expanduser().resolve()),
+                       "--log-level", getattr(args, "log_level", "INFO"),
                        "--service-token", token, "--service-file", str(self.state_path)]
             if args.competition:
                 options.extend(["--competition", args.competition])
@@ -105,7 +108,13 @@ class Service:
             save_auth(self.state_path, {"token": token, "state": "starting", "version": __version__,
                       "dashboard": None if args.no_web else f"http://127.0.0.1:{args.port}"})
             command = [sys.executable, "-u", "-m", "beauclaw", "watch", *options]
-            shell = f"exec {shlex.join(command)} >> {shlex.quote(str(self.log_path))} 2>&1"
+            # Python owns rotating application files; never hold a shell redirect
+            # open on an inode that the log handler will rename during rotation.
+            if self.console_path.exists():
+                self.console_path.replace(self.console_path.with_suffix(".log.1"))
+            fd = os.open(self.console_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.close(fd)
+            shell = f"exec {shlex.join(command)} >> {shlex.quote(str(self.console_path))} 2>&1"
             result = self.tmux("new-session", "-d", "-s", self.session, "-c", str(self.db.parent),
                                "/bin/sh", "-c", shell)
             if result.returncode:
@@ -118,7 +127,7 @@ class Service:
                 if current["state"] == "stopped":
                     break
                 time.sleep(0.1)
-            raise ValueError(f"Background worker did not start; check the log: {self.log_path}")
+            raise ValueError(f"Background worker did not start; check {self.log_path} and {self.console_path}")
 
     def stop(self, timeout: float = 30, force: bool = False) -> bool:
         if not self.db.parent.exists():
